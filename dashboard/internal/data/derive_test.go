@@ -15,6 +15,7 @@ func TestDeriveNoteFields(t *testing.T) {
 		payRange string
 		paySrc   string
 		last     string
+		postedOn string
 	}{
 		{
 			name: "remote with posted comma range and rejection date",
@@ -257,6 +258,39 @@ func TestDeriveNoteFields(t *testing.T) {
 			payRange: "",
 			last:     "2026-04-11",
 		},
+		{
+			name: "posted date populates PostedOn without becoming last contact",
+			app: model.CareerApplication{
+				Date:  "2026-08-06",
+				Notes: "Santa Clara, CA; posted 2026-08-07",
+			},
+			location: "Santa Clara, CA",
+			workMode: "Full",
+			last:     "2026-08-06",
+			postedOn: "2026-08-07",
+		},
+		{
+			name: "a real interaction still wins last contact over the posting date",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "Austin, TX; Posted: 2026-05-20. Recruiter screen 2026-06-14",
+			},
+			location: "Austin, TX",
+			workMode: "Full",
+			last:     "2026-06-14",
+			postedOn: "2026-05-20",
+		},
+		{
+			name: "the POSTED pay marker carries no date and sets no PostedOn",
+			app: model.CareerApplication{
+				Date:  "2026-06-04",
+				Notes: "Remote US. Base $174,986-209,983 (POSTED)",
+			},
+			workMode: "Remote",
+			payRange: "$174,986-209,983",
+			paySrc:   "POSTED",
+			last:     "2026-06-04",
+		},
 	}
 
 	for _, tc := range cases {
@@ -279,6 +313,9 @@ func TestDeriveNoteFields(t *testing.T) {
 			}
 			if tc.app.LastContact != tc.last {
 				t.Errorf("LastContact = %q, want %q", tc.app.LastContact, tc.last)
+			}
+			if tc.app.PostedOn != tc.postedOn {
+				t.Errorf("PostedOn = %q, want %q", tc.app.PostedOn, tc.postedOn)
 			}
 		})
 	}
