@@ -403,13 +403,6 @@ const USER_PATHS = [
   'opencode.json',
   '.claude/settings.json',
   '.claude/hooks/',
-  // ── fork-local (WJiangH/career-ops) ──────────────────────────────
-  // Not upstream files. Registered as user-owned so the updater leaves them
-  // alone: listing them as SYSTEM_PATHS would make `apply` try to fetch paths
-  // that do not exist upstream. Unlike writing-samples/README.md — a
-  // system-owned doc inside a user dir — user_profiles/ is ours end to end.
-  'user_profiles/',
-  'FORK-WORKFLOW.md',
 ];
 
 function parseVersionFile(raw) {
