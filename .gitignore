@@ -53,6 +53,14 @@ interview-prep/sessions/*
 writing-samples/*
 !writing-samples/README.md
 
+# User profile documents — source resumes (.docx/.pdf), transcripts, offer
+# letters, immigration paperwork, per-company archives. Everything here is
+# personal and NEVER committed; only the README describing the folder is.
+# Anchored + broad on purpose: nested folders are ignored wholesale, since
+# nothing under here is ever intended for the repo.
+/user_profiles/*
+!/user_profiles/README.md
+
 # User config and customization (never auto-updated)
 config/profile.yml
 config/cv-facts.json
