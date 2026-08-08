@@ -26,6 +26,11 @@ var (
 	reMoneySpan = buildMoneySpanRegex(currencyTokens)
 	// ISO dates embedded in notes ("Rejected 2026-06-04", "viewed 2026-06-04")
 	reISODate = regexp.MustCompile(`\b20\d{2}-\d{2}-\d{2}\b`)
+
+	// "posted 2026-08-07" / "Posted: 2026-08-07" — when the requisition went
+	// live, as written by scan.mjs into the tracker notes. Distinct from the
+	// "(POSTED)" pay-source marker, which carries no date.
+	rePostedOn = regexp.MustCompile(`(?i)\bposted:?\s+(20\d{2}-\d{2}-\d{2})\b`)
 	// "City ST" / "City, ST" with a strict two-letter US state code so prose like
 	// "Sams AI" or "Kerin Colby DONE" can't false-positive.
 	reCityState = regexp.MustCompile(`\b([A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,2}),? (A[KLRZ]|C[AOT]|D[CE]|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|PA|RI|S[CD]|T[NX]|UT|V[AT]|W[AIVY])\b`)
@@ -194,10 +199,21 @@ func deriveNoteFields(app *model.CareerApplication) {
 		}
 	}
 
+	// Posting date: when the requisition went live. Drives the POSTED column,
+	// which answers "is this req still plausibly being worked?" — a role posted
+	// yesterday is a very different bet from one that has sat open for months.
+	if m := rePostedOn.FindStringSubmatch(app.Notes); m != nil {
+		app.PostedOn = m[1]
+	}
+
 	// Last contact: the most recent ISO date mentioned anywhere in the notes
 	// (rejections, recruiter views, phone screens), else the applied date.
+	// The posting date is stripped first — when the req went live is not an
+	// interaction with the company, and letting it through would show a
+	// freshly-posted role as if it had just been touched.
+	contactNotes := rePostedOn.ReplaceAllString(app.Notes, "")
 	last := app.Date
-	for _, d := range reISODate.FindAllString(app.Notes, -1) {
+	for _, d := range reISODate.FindAllString(contactNotes, -1) {
 		if d > last {
 			last = d
 		}

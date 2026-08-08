@@ -167,6 +167,7 @@ const (
 	ColHasReport                   // RPT: ✓/—
 	ColHasPDF                      // PDF: ✓/—
 	ColLastContact                 // LAST contact date
+	ColPosted                      // POSTED: how long the req has been open
 )
 
 // colDef describes one optional column for the picker UI.
@@ -186,6 +187,7 @@ func getOptionalCols() []colDef {
 		{ColHasReport, i18n.Current.ColReport, "✓/—", 4, false},
 		{ColHasPDF, i18n.Current.ColPDF, "✓/—", 4, false},
 		{ColLastContact, i18n.Current.ColLast, "", 10, false},
+		{ColPosted, i18n.Current.ColPosted, "", 10, false},
 	}
 }
 
@@ -1527,7 +1529,7 @@ func (m PipelineModel) renderBody() string {
 type colWidths struct {
 	num, score, company, status, role int
 	// optional columns — 0 means the column is hidden
-	date, loc, pay, rpt, pdf, last int
+	date, loc, pay, rpt, pdf, last, posted int
 }
 
 func (m PipelineModel) colVisible(id ColumnID) bool {
@@ -1563,7 +1565,10 @@ func (m PipelineModel) columnWidths() colWidths {
 	if m.colVisible(ColLastContact) {
 		c.last = 10
 	}
-	fixed := c.num + c.score + c.date + c.company + c.status + c.loc + c.pay + c.rpt + c.pdf + c.last
+	if m.colVisible(ColPosted) {
+		c.posted = 10
+	}
+	fixed := c.num + c.score + c.date + c.company + c.status + c.loc + c.pay + c.rpt + c.pdf + c.last + c.posted
 	c.role = m.width - fixed - 14 // separators + outer padding
 	if c.role < 15 {
 		c.role = 15
@@ -1609,6 +1614,40 @@ func (m PipelineModel) renderCheckCell(yes bool, width int) string {
 		color = m.theme.Green
 	}
 	return lipgloss.NewStyle().Foreground(color).Width(width).Render(text)
+}
+
+// postedAgeThresholds bound the POSTED column's colour bands, in days since the
+// requisition went live. A req posted this week is plausibly still being worked;
+// one open past a quarter is often a pipeline-filler or an abandoned listing.
+const (
+	postedFreshDays = 7
+	postedWarmDays  = 30
+	postedStaleDays = 90
+)
+
+// renderPostedCell shows how long a requisition has been open, colour-coded by
+// age: green within a week, yellow within a month, peach within a quarter, red
+// beyond. Rows whose notes carry no "posted <date>" render a subtle dash.
+func (m PipelineModel) renderPostedCell(app model.CareerApplication, width int) string {
+	if app.PostedOn == "" {
+		return lipgloss.NewStyle().Foreground(m.theme.Subtext).Width(width).Render("—")
+	}
+	posted, err := time.Parse("2006-01-02", app.PostedOn)
+	if err != nil {
+		return lipgloss.NewStyle().Foreground(m.theme.Subtext).Width(width).Render("—")
+	}
+	days := int(time.Since(posted).Hours() / 24)
+	color := m.theme.Red
+	switch {
+	case days <= postedFreshDays:
+		color = m.theme.Green
+	case days <= postedWarmDays:
+		color = m.theme.Yellow
+	case days <= postedStaleDays:
+		color = m.theme.Peach
+	}
+	return lipgloss.NewStyle().Foreground(color).Width(width).
+		Render(truncateRunes(formatTimeAgo(app.PostedOn), width-1))
 }
 
 // renderPayCell prefers the pay range parsed from notes and falls back to the
@@ -1663,6 +1702,9 @@ func (m PipelineModel) renderColumnHeader() string {
 	}
 	if cw.last > 0 {
 		segments = append(segments, cell(i18n.Current.ColLast, cw.last))
+	}
+	if cw.posted > 0 {
+		segments = append(segments, cell(i18n.Current.ColPosted, cw.posted))
 	}
 
 	padStyle := lipgloss.NewStyle().Padding(0, 2)
@@ -1738,6 +1780,9 @@ func (m PipelineModel) renderAppLine(app model.CareerApplication, selected bool)
 			lastStyle = lastStyle.Foreground(m.theme.Text)
 		}
 		segments = append(segments, lastStyle.Render(truncateRunes(lastText, cw.last)))
+	}
+	if cw.posted > 0 {
+		segments = append(segments, m.renderPostedCell(app, cw.posted))
 	}
 
 	line := " " + strings.Join(segments, " ")
