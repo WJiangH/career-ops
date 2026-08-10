@@ -262,6 +262,10 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
       // Collect it instead of reporting a failure that did not happen.
       // ~2 min of polling covers a full multi-ATS sweep; past that the real
       // error stands.
+      // Say what is happening. Without this the pane keeps claiming "scanning
+      // the network" for the full two minutes, so a sweep that already finished
+      // looks hung — which is exactly how it read on the phone.
+      setStatus("Lost the connection mid-scan — collecting the result…");
       for (let i = 0; i < 60 && acc.length === 0; i++) {
         await new Promise((res) => setTimeout(res, 2000));
         try {

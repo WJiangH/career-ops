@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CloudOff, Loader2 } from "lucide-react";
 
 // Tells you when the Mac stopped answering.
@@ -16,10 +16,18 @@ import { CloudOff, Loader2 } from "lucide-react";
 // serving, not just that something answered the port.
 
 const OK_MS = 20_000; // healthy: a slow heartbeat is enough to notice a sleep
-const DOWN_MS = 5_000; // unreachable: check back often so recovery feels instant
+const DOWN_MS = 5_000; // suspect/down: check back often so recovery feels instant
+const TIMEOUT_MS = 8_000;
+// Busy is not gone. A discovery sweep parses multi-megabyte ATS datasets, and
+// JSON.parse is synchronous — the event loop stalls for seconds at a time and a
+// single health check times out. Reporting "your Mac isn't answering" then is a
+// lie told at the exact moment the user is watching real progress. Only a run of
+// consecutive failures means anything.
+const FAILS_TO_ALARM = 3;
 
 export function ConnectionBanner() {
   const [down, setDown] = useState(false);
+  const fails = useRef(0);
   // Never flash on the very first tick — a cold start or a slow first paint
   // would otherwise show "unreachable" for a moment on every launch.
   const [settled, setSettled] = useState(false);
@@ -32,10 +40,10 @@ export function ConnectionBanner() {
       if (stop) return;
       let ok = false;
       try {
-        // 4s cap: a sleeping Mac does not refuse the connection, it black-holes
-        // it, so without a timeout this hangs instead of reporting anything.
+        // A sleeping Mac black-holes the connection rather than refusing it,
+        // so without a cap this hangs instead of reporting anything.
         const ctl = new AbortController();
-        const t = setTimeout(() => ctl.abort(), 4000);
+        const t = setTimeout(() => ctl.abort(), TIMEOUT_MS);
         const r = await fetch("/api/version", { cache: "no-store", signal: ctl.signal });
         clearTimeout(t);
         ok = r.ok;
@@ -43,8 +51,11 @@ export function ConnectionBanner() {
         ok = false;
       }
       if (stop) return;
-      setDown(!ok);
+      fails.current = ok ? 0 : fails.current + 1;
+      setDown(fails.current >= FAILS_TO_ALARM);
       setSettled(true);
+      // Poll fast while suspect, not only once alarming — otherwise confirming
+      // a real outage takes three slow beats (a full minute).
       timer = setTimeout(check, ok ? OK_MS : DOWN_MS);
     };
 
@@ -53,6 +64,9 @@ export function ConnectionBanner() {
     // the poll interval makes a recovered connection feel broken.
     const wake = () => {
       if (document.visibilityState === "visible") {
+        // Coming back from the background is not evidence of an outage — the
+        // suspended tab simply could not poll. Start the count over.
+        fails.current = 0;
         clearTimeout(timer);
         void check();
       }
