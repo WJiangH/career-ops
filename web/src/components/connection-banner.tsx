@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { CloudOff, Loader2 } from "lucide-react";
+import { CloudOff, Loader2, RefreshCw } from "lucide-react";
 
 // Tells you when the Mac stopped answering.
 //
@@ -28,6 +28,13 @@ const FAILS_TO_ALARM = 3;
 export function ConnectionBanner() {
   const [down, setDown] = useState(false);
   const fails = useRef(0);
+  // The build the app was loaded from. Resuming a backgrounded PWA does not
+  // navigate, so the JS in memory can be arbitrarily old while the Mac serves
+  // something newer — and nothing on screen says so. That cost a full
+  // debugging round trip: a fix was deployed and verified in the bundle, and
+  // the phone kept reproducing the old behaviour.
+  const loadedSha = useRef<string | null>(null);
+  const [stale, setStale] = useState(false);
   // Never flash on the very first tick — a cold start or a slow first paint
   // would otherwise show "unreachable" for a moment on every launch.
   const [settled, setSettled] = useState(false);
@@ -47,6 +54,13 @@ export function ConnectionBanner() {
         const r = await fetch("/api/version", { cache: "no-store", signal: ctl.signal });
         clearTimeout(t);
         ok = r.ok;
+        if (ok) {
+          const { sha } = (await r.json()) as { sha?: string };
+          if (sha) {
+            if (loadedSha.current === null) loadedSha.current = sha;
+            else if (sha !== loadedSha.current) setStale(true);
+          }
+        }
       } catch {
         ok = false;
       }
@@ -82,6 +96,19 @@ export function ConnectionBanner() {
       window.removeEventListener("online", wake);
     };
   }, []);
+
+  if (stale && !down) {
+    return (
+      <button
+        onClick={() => window.location.reload()}
+        className="fixed inset-x-0 top-0 z-[80] flex w-full items-center justify-center gap-2 bg-brand px-4 py-2 text-center text-xs font-medium text-white shadow-md"
+        style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top))" }}
+      >
+        <RefreshCw className="size-3.5 shrink-0" />
+        <span>A newer build is running on your Mac — tap to reload.</span>
+      </button>
+    );
+  }
 
   if (!settled || !down) return null;
 
