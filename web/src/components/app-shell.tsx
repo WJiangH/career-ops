@@ -14,6 +14,7 @@ import { ExploreProvider } from "@/components/explore/explore-provider";
 import { FirstScoreView } from "@/components/explore/first-score-view";
 import { BetaBanner } from "@/components/beta/beta-banner";
 import { ConnectionBanner } from "@/components/connection-banner";
+import { ServiceWorkerRegistrar } from "@/components/sw-register";
 import { WorkerPills } from "@/components/jobs/worker-pills";
 import { UsageMeter } from "@/components/usage-meter";
 import { instrumentSerif } from "@/lib/fonts";
@@ -80,6 +81,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <FirstScoreView />
         <BetaBanner />
         <ConnectionBanner />
+        <ServiceWorkerRegistrar />
       </div>
       </ExploreProvider>
       </ApplyProvider>
