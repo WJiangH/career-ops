@@ -221,6 +221,9 @@ export async function POST(req: Request) {
   // until that work actually settles, instead of releasing the tracker-delete
   // guard while mark-pdf-ready.mjs is still actively writing applications.md.
   let pdfRenderPromise: Promise<void> | null = null;
+  // Set by the kill timer so the finished record says "timed out" rather than
+  // the generic "hit an error", which sent us reading logs to tell them apart.
+  let timedOut = false;
   let writeTokenReleased = false;
   const releaseWriteTokenOnce = () => {
     if (writeToken !== null && !writeTokenReleased) {
@@ -235,6 +238,8 @@ export async function POST(req: Request) {
       let sawError = false;
       let lastTokens = 0; // per-run token cost from the Claude result event (#6) — local only
       let lastCostUsd: number | null = null;
+      let terminalStatus: "done" | "error" | null = null;
+      let terminalSummary = "";
       // pdf-mode's agent only tailors content now (rendering moved to the
       // backend, #2172) — but its killMs still has to leave real headroom
       // inside the route's overall maxDuration (800s): the render+mark phase
@@ -244,11 +249,30 @@ export async function POST(req: Request) {
       // generate-pdf.mjs mid-render. 600s agent / ~200s render is ample —
       // a Chromium PDF render normally takes low tens of seconds even with a
       // cold Playwright launch.
-      const killMs = kind === "pdf" ? 600_000 : 285_000;
+      // 285s used to be the non-pdf budget, chosen when the browser held the
+      // connection and a platform timeout was the real ceiling. Runs are
+      // server-owned now, and a genuine oferta evaluation measures 7-8 minutes
+      // — a Workday JD that WebFetch cannot render costs another API round trip
+      // on top. The old value killed real work at 4m45s: observed at exactly
+      // 286s, one second past the timer, mid-sentence after the agent had
+      // already reserved its report number. Both budgets now sit inside the
+      // route's 800s maxDuration with room for pdf's post-agent render.
+      const killMs = kind === "pdf" ? 600_000 : 660_000;
       killer = setTimeout(() => {
+        timedOut = true;
         try { child.kill("SIGTERM"); } catch { /* ignore */ }
       }, killMs);
       const send = (obj: unknown) => {
+        // Latch the terminal outcome from the event itself. sawError only
+        // reflects the stderr regex, so a run failed by an honesty gate — which
+        // reports via send({type:"error"}) — was being recorded as "done".
+        const t = (obj as { type?: string; msg?: string })?.type;
+        if (t === "error") {
+          terminalStatus = "error";
+          terminalSummary = (obj as { msg?: string }).msg ?? "";
+        } else if (t === "done" && terminalStatus === null) {
+          terminalStatus = "done";
+        }
         // Persist first, unconditionally: the transcript is the product, the
         // HTTP stream is just one optional consumer of it.
         appendEvent(jobRunId, obj);
@@ -261,8 +285,10 @@ export async function POST(req: Request) {
           if (killer) clearTimeout(killer);
           releaseWriteTokenOnce();
           finishJob(jobRunId, {
-            status: outcome?.status ?? (sawError ? "error" : "done"),
-            summary: outcome?.summary,
+            status: outcome?.status ?? terminalStatus ?? (sawError ? "error" : "done"),
+            summary: outcome?.summary ?? (timedOut
+              ? `Timed out after ${Math.round(killMs / 1000)}s — re-run it, or evaluate from the Mac where nothing bounds it.`
+              : terminalSummary || undefined),
             tokens: lastTokens,
             costUsd: lastCostUsd,
           });
