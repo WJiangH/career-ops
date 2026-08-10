@@ -47,10 +47,32 @@ export function serializePortals(f: FilterLists): string {
   return out;
 }
 
+/**
+ * Exclusions the real portals.yml declares, always applied on top of the UI's.
+ *
+ * The Explorer's chips are seeded from portals.yml once and then live in the
+ * browser, so the two drift: an exclusion added to portals.yml afterwards never
+ * reaches a scan, and a second browser starts from a different snapshot
+ * entirely. Positives are a preference and stay the UI's to own — but an
+ * exclusion is a safety rail, and the cost of it silently lapsing is a role
+ * that survives discovery, gets added to the pipeline, and burns a real
+ * evaluation to conclude what its title already said.
+ *
+ * Union, not replace: the UI can always add more. It cannot remove one that
+ * portals.yml declares — to drop an exclusion for good, drop it there.
+ */
+function inheritedNegatives(): string[] {
+  const cfg = loadYaml("portals.yml");
+  const tf = cfg?.title_filter;
+  if (!tf || typeof tf !== "object") return [];
+  return listFrom((tf as Record<string, unknown>).negative);
+}
+
 /** Write the ephemeral filter file to a temp path; caller cleans it up. */
 export function writeTempPortals(f: FilterLists): string {
   const file = path.join(os.tmpdir(), `career-ops-explore-${randomUUID()}.yml`);
-  fs.writeFileSync(file, serializePortals(f), "utf8");
+  const negative = [...new Set([...f.negative, ...inheritedNegatives()])];
+  fs.writeFileSync(file, serializePortals({ ...f, negative }), "utf8");
   return file;
 }
 
