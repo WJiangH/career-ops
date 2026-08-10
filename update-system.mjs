@@ -186,6 +186,7 @@ const SYSTEM_PATHS = [
   'match-star.mjs',
   'jd-skill-gap.mjs',
   'cv-evidence-gap.mjs',
+  'filter-audit.mjs',
   'prepare-application.mjs',
   'application-artifacts.mjs',
   'providers/',
