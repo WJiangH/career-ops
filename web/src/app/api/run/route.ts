@@ -6,6 +6,7 @@ import { careerOpsRoot, readMemory, findReportFile } from "@/lib/career-ops";
 import { resolvePdfPaths, type PdfPaths } from "@/lib/pdf-paths.mjs";
 import { renderAndMarkPdf } from "@/lib/pdf-render.mjs";
 import { acquireTrackerWrite, releaseTrackerWrite } from "@/lib/core/run-registry";
+import { appendEvent, createJob, finishJob } from "@/lib/core/job-log";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -73,13 +74,13 @@ Posting URL: ${input}`;
 }
 
 export async function POST(req: Request) {
-  let body: { kind?: string; input?: string; cliId?: string };
+  let body: { kind?: string; input?: string; cliId?: string; jobId?: string };
   try {
     body = await req.json();
   } catch {
     return new Response(JSON.stringify({ error: "bad json" }), { status: 400 });
   }
-  const { kind = "evaluate", input, cliId } = body;
+  const { kind = "evaluate", input, cliId, jobId } = body;
   if (!input || !cliId) {
     return new Response(JSON.stringify({ error: "input and cliId required" }), { status: 400 });
   }
@@ -190,13 +191,29 @@ export async function POST(req: Request) {
   // (tracker.mjs delete doesn't yet share a lock with merge-tracker — see run-registry).
   const writeToken = kind === "evaluate" || kind === "pdf" ? acquireTrackerWrite() : null;
 
-  const child = spawn(binPath, args, { cwd: careerOpsRoot(), env: process.env });
+  // The client may supply the id it will resubscribe with; otherwise mint one.
+  // Rejecting a malformed id here (rather than sanitizing) keeps the id the
+  // client holds and the id on disk identical — a rewritten one would 404 on
+  // reconnect.
+  const jobRunId = jobId && /^[A-Za-z0-9._-]{1,128}$/.test(jobId) ? jobId : `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  const child = spawn(binPath, args, { cwd: careerOpsRoot(), env: process.env, detached: false });
   const enc = new TextEncoder();
 
-  // `closed` + kill timer in the OUTER scope so cancel() (client disconnect) can
-  // flip `closed` before the child's late handlers run, and send() is try/catch'd —
-  // otherwise a late enqueue onto a closed controller throws uncaught (see #1155).
+  // The run is now owned by the server, so two states that used to share one
+  // `closed` flag have to be distinguished:
+  //   clientGone — nobody is reading the HTTP stream. Stop enqueuing; keep the
+  //                child, the transcript and the honesty gates running.
+  //   closed     — the run itself is over and finalized. Late handlers no-op.
+  // Conflating them is exactly why locking a phone killed an evaluation: cancel()
+  // set one flag that both killed the child AND made child.on("close") skip every
+  // honesty gate, so the run neither finished nor recorded anything.
   let closed = false;
+  let clientGone = false;
+  // Durable transcript. Every event lands here whether or not a client is
+  // attached, and a reconnecting client replays from its line offset.
+  const job = createJob({ id: jobRunId, kind, input, title: `${kind} · ${input.slice(0, 80)}` });
+  void job;
   let killer: ReturnType<typeof setTimeout> | undefined;
   // pdf-kind's render+mark work (renderPdf, below) keeps running detached even
   // after the agent child closes — and even after a client disconnect fires
@@ -232,19 +249,31 @@ export async function POST(req: Request) {
         try { child.kill("SIGTERM"); } catch { /* ignore */ }
       }, killMs);
       const send = (obj: unknown) => {
-        if (closed) return;
-        try { controller.enqueue(enc.encode(JSON.stringify(obj) + "\n")); } catch { closed = true; }
+        // Persist first, unconditionally: the transcript is the product, the
+        // HTTP stream is just one optional consumer of it.
+        appendEvent(jobRunId, obj);
+        if (closed || clientGone) return;
+        try { controller.enqueue(enc.encode(JSON.stringify(obj) + "\n")); } catch { clientGone = true; }
       };
-      const close = () => {
+      const close = (outcome?: { status: "done" | "error"; summary?: string }) => {
         if (!closed) {
           closed = true;
           if (killer) clearTimeout(killer);
           releaseWriteTokenOnce();
+          finishJob(jobRunId, {
+            status: outcome?.status ?? (sawError ? "error" : "done"),
+            summary: outcome?.summary,
+            tokens: lastTokens,
+            costUsd: lastCostUsd,
+          });
           try { controller.close(); } catch { /* */ }
         }
       };
 
       child.stdout.on("data", (d: Buffer) => {
+        // Deliberately not gated on clientGone: emittedText/sawError feed the
+        // honesty gates in child.on("close"), so skipping the parse would make a
+        // completed run look like "the CLI produced no output".
         if (closed) return;
         if (!isClaude) {
           emittedText = true;
@@ -394,17 +423,18 @@ export async function POST(req: Request) {
       });
     },
     cancel() {
-      closed = true;
-      if (killer) clearTimeout(killer);
-      try { child.kill("SIGTERM"); } catch { /* ignore */ }
-      if (pdfRenderPromise) {
-        // Render/mark keeps running after this client disconnects — wait for
-        // it to settle before releasing the guard, so a concurrent tracker
-        // delete can't race mark-pdf-ready.mjs's still-in-flight write.
-        pdfRenderPromise.finally(releaseWriteTokenOnce);
-      } else {
-        releaseWriteTokenOnce();
-      }
+      // A reader went away — a locked phone, a closed tab, a backgrounded PWA.
+      // That is not a reason to destroy the work: the child keeps running, the
+      // transcript keeps accruing, and the client resubscribes via
+      // GET /api/jobs/{id}/events?from=N. The kill timer stays armed so a
+      // genuinely stuck agent is still bounded.
+      clientGone = true;
+      // The write token is deliberately NOT released here any more. It used to
+      // be, because a disconnect ended the run — now the run outlives the
+      // reader, and dropping the tracker-delete guard while the agent is still
+      // writing applications.md would reintroduce the very race the token
+      // exists to prevent. close() owns the release, on success and failure
+      // alike, and the kill timer still bounds a genuinely stuck agent.
     },
   });
 

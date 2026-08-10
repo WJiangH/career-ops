@@ -67,8 +67,12 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
       const raw = localStorage.getItem(JOBS_KEY);
       const arr = raw ? JSON.parse(raw) : null;
       if (Array.isArray(arr)) {
-        // anything left "running" from a previous session is stale → mark interrupted
-        setJobs(arr.map((j: Job) => (j.status === "running" ? { ...j, status: "error", steps: [...(j.steps || []), { kind: "status", label: "Interrupted (page reloaded)", ts: Date.now() }] } : j)));
+        // A "running" job from a previous session is no longer presumed dead.
+        // The server owns runs now, so a reload — or a phone that locked and
+        // came back — may well be rejoining work that is still going. Keep the
+        // optimistic state and let the reconcile effect below settle it against
+        // the server, which is the only thing that actually knows.
+        setJobs(arr as Job[]);
       }
     } catch {
       /* ignore */
@@ -88,6 +92,51 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
 
   const patch = useCallback((id: string, fn: (j: Job) => Job) => {
     setJobs((js) => js.map((j) => (j.id === id ? fn(j) : j)));
+  }, []);
+
+  // Reconcile with the server: adopt runs this browser has never seen (started
+  // from the Mac, or from this phone before its localStorage was cleared) and
+  // settle anything we still think is running. Polls only while something is in
+  // flight, so an idle dashboard is silent.
+  useEffect(() => {
+    let stop = false;
+    const tick = async () => {
+      let serverJobs: Array<{ id: string; kind: string; input: string; title?: string; status: string; startedAt: number; summary?: string }>;
+      try {
+        const r = await fetch("/api/jobs", { cache: "no-store" });
+        if (!r.ok) return;
+        ({ jobs: serverJobs } = await r.json());
+      } catch {
+        return; // offline; the run is unaffected, try again next tick
+      }
+      setJobs((js) => {
+        const byId = new Map(js.map((j) => [j.id, j]));
+        let changed = false;
+        for (const sj of serverJobs) {
+          const local = byId.get(sj.id);
+          if (!local) {
+            // Only adopt live work. Back-filling every historical run would
+            // bury the local list under runs the user already dealt with.
+            if (sj.status !== "running") continue;
+            byId.set(sj.id, {
+              id: sj.id, title: sj.title || sj.kind, subtitle: sj.input, page: "/", input: sj.input,
+              kind: sj.kind as Job["kind"], status: "running",
+              steps: [{ kind: "status", label: "Rejoined — started elsewhere", ts: Date.now() }],
+              text: "", startedAt: sj.startedAt,
+            } as Job);
+            changed = true;
+          } else if (local.status === "running" && sj.status !== "running") {
+            byId.set(sj.id, { ...local, status: sj.status === "error" ? "error" : "done", endedAt: Date.now(),
+              steps: [...local.steps, { kind: "status", label: sj.summary || "Finished", ts: Date.now() }] });
+            changed = true;
+          }
+        }
+        return changed ? [...byId.values()].sort((a, b) => b.startedAt - a.startedAt) : js;
+      });
+    };
+    void tick();
+    const iv = setInterval(() => { if (!stop) void tick(); }, 5000);
+    return () => { stop = true; clearInterval(iv); };
   }, []);
 
   const startJob = useCallback(
@@ -152,11 +201,73 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
           }
         };
 
+        // Events arrive twice over: live from the POST stream while a reader is
+        // attached, and from the durable transcript on reconnect. One handler
+        // for both, and `seen` counts what we have consumed — the server appends
+        // every event to the log before enqueuing it, so that count IS the line
+        // offset to resume from.
+        let seen = 0;
+        let terminal: "done" | "error" | null = null;
+        let terminalMsg = "";
+        const applyEvent = (ev: { type?: string; name?: string; label?: string; text?: string; tokens?: number; costUsd?: number; msg?: string }) => {
+          seen++;
+          if (ev.type === "tool") {
+            steps.push({ kind: "tool", label: ev.name!, ts: Date.now() });
+            patch(id, (j) => ({ ...j, steps: [...j.steps, { kind: "tool", label: ev.name!, ts: Date.now() }] }));
+          } else if (ev.type === "status") {
+            steps.push({ kind: "status", label: ev.label!, ts: Date.now() });
+            patch(id, (j) => ({ ...j, steps: [...j.steps, { kind: "status", label: ev.label!, ts: Date.now() }] }));
+          } else if (ev.type === "text") {
+            const full = text + ev.text;
+            const vm = full.match(/VERDICT:[^\n]*/i);
+            if (vm) verdictLine = vm[0];
+            text = full.slice(-8000);
+            patch(id, (j) => ({ ...j, text }));
+          } else if (ev.type === "done") {
+            if (typeof ev.tokens === "number") doneTokens = ev.tokens;
+            if (typeof ev.costUsd === "number") doneCostUsd = ev.costUsd;
+            terminal = "done";
+          } else if (ev.type === "error") {
+            terminal = "error";
+            terminalMsg = ev.msg || "Error";
+          }
+        };
+
+        // Poll the durable transcript until the server marks the run finished.
+        // Deliberately polling, not a second stream: the bug being fixed is that
+        // held connections die, so the recovery path must not need one to live.
+        const drainFromLog = async () => {
+          for (;;) {
+            let payload: { events?: unknown[]; nextLine?: number; running?: boolean; job?: { status?: string; summary?: string } };
+            try {
+              const r = await fetch(`/api/jobs/${id}/events?from=${seen}`, { cache: "no-store" });
+              if (!r.ok) { finish("error", "Lost track of this run"); return; }
+              payload = await r.json();
+            } catch {
+              // Still offline — back off and keep trying rather than declaring
+              // failure; the run on the Mac is unaffected either way.
+              await new Promise((r) => setTimeout(r, 3000));
+              continue;
+            }
+            for (const ev of payload.events ?? []) applyEvent(ev as Parameters<typeof applyEvent>[0]);
+            if (terminal) { finish(terminal, terminal === "done" ? "Done" : terminalMsg); return; }
+            if (!payload.running) {
+              const st = payload.job?.status === "error" ? "error" : "done";
+              finish(st, payload.job?.summary || (st === "done" ? "Done" : "Ended"));
+              return;
+            }
+            await new Promise((r) => setTimeout(r, 1500));
+          }
+        };
+
         try {
           const res = await fetch("/api/run", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ kind: opts.kind, input: opts.input, cliId }),
+            // Hand the server our id so the transcript is addressable the moment
+            // the run starts — without it a client that dies early could never
+            // find its own job again.
+            body: JSON.stringify({ kind: opts.kind, input: opts.input, cliId, jobId: id }),
           });
           if (!res.ok || !res.body) {
             const e = await res.json().catch(() => ({}));
@@ -175,36 +286,18 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
               const line = buf.slice(0, nl).trim();
               buf = buf.slice(nl + 1);
               if (!line) continue;
-              try {
-                const ev = JSON.parse(line);
-                if (ev.type === "tool") {
-                  steps.push({ kind: "tool", label: ev.name, ts: Date.now() });
-                  patch(id, (j) => ({ ...j, steps: [...j.steps, { kind: "tool", label: ev.name, ts: Date.now() }] }));
-                } else if (ev.type === "status") {
-                  steps.push({ kind: "status", label: ev.label, ts: Date.now() });
-                  patch(id, (j) => ({ ...j, steps: [...j.steps, { kind: "status", label: ev.label, ts: Date.now() }] }));
-                } else if (ev.type === "text") {
-                  const full = text + ev.text;
-                  const vm = full.match(/VERDICT:[^\n]*/i);
-                  if (vm) verdictLine = vm[0];
-                  text = full.slice(-8000);
-                  patch(id, (j) => ({ ...j, text }));
-                } else if (ev.type === "done") {
-                  // finish happens on stream-close; capture the per-run cost it carries
-                  if (typeof ev.tokens === "number") doneTokens = ev.tokens;
-                  if (typeof ev.costUsd === "number") doneCostUsd = ev.costUsd;
-                } else if (ev.type === "error") {
-                  finish("error", ev.msg || "Error");
-                  return;
-                }
-              } catch {
-                /* skip */
-              }
+              try { applyEvent(JSON.parse(line)); } catch { /* partial */ }
             }
+            if (terminal === "error") { finish("error", terminalMsg); return; }
           }
-          finish("done", "Done");
+          if (terminal) { finish(terminal, terminal === "done" ? "Done" : terminalMsg); return; }
+          // Stream ended with no verdict — the reader was cut off, not the run.
+          // The work is still going on the Mac; pick it back up from the log.
+          await drainFromLog();
         } catch {
-          finish("error", "Connection error");
+          // Network dropped mid-stream (screen lock, app switch, Wi-Fi change).
+          // Same story: reattach instead of reporting a failure that did not happen.
+          await drainFromLog();
         }
       })();
 
