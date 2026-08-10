@@ -110,6 +110,7 @@ AI-powered, CLI-agnostic job search automation: pipeline tracking, offer evaluat
 | `salary-gap.mjs` | Desired/advertised/actual comp gap analyzer — folds report `advertised_comp` + `data/salary-observations.tsv` (JSON or `--summary`) |
 | `assessment-log.mjs` | Skills-assessment logger — `add` appends platform/subject/threshold/score + staleness note to `data/assessments.tsv` (JSON or `--summary`) |
 | `jd-skill-gap.mjs` | Zero-LLM JD skill classifier vs `cv.md`: existing / supportedByResume / gap; never auto-adds claims to `cv.md` (JSON or `--summary`) |
+| `cv-evidence-gap.mjs` | Zero-LLM audit of `cv.md` against itself: skills named in the Skills section that no bullet ever demonstrates, ranked by how often `reports/` Machine Summaries actually raised them as a gap. Complements `upskill.mjs` (what to learn — excludes anything in cv.md) and `jd-skill-gap.mjs` (one JD vs cv.md). Never writes (JSON or `--summary`) |
 | `contacts.mjs` | Job-search phonebook → vCard 3.0 exporter — stable UIDs so re-imports update instead of duplicating on platforms that honor vCard UID (JSON, `--summary`, `--vcf`, `--caller-id`) |
 | `data/contacts.tsv` | Job-search contact list — recruiters/hiring managers/peers saved from `contacto` (user layer, gitignored third-party PII) |
 | `outcome.mjs` | Record application outcome, archive artifacts, and sync tracker (`node outcome.mjs <selector> <type>`) |
