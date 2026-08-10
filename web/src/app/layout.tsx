@@ -9,6 +9,17 @@ export const metadata: Metadata = {
   // Home-screen / standalone (iOS): let our theme-color flow up to the status bar
   // + Dynamic Island; safe-area insets handle the layout.
   appleWebApp: { capable: true, statusBarStyle: "black-translucent", title: "career-ops" },
+  manifest: "/manifest.webmanifest",
+  // iOS ignores SVG for the home-screen icon and will fall back to a screenshot
+  // of the page, so the apple entry has to be a real PNG. icon.svg stays as the
+  // crisp browser-tab favicon.
+  icons: {
+    icon: [
+      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/icon-192.png", sizes: "192x192", type: "image/png" },
+    ],
+    apple: [{ url: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
+  },
 };
 
 export const viewport: Viewport = {
