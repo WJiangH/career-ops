@@ -1870,6 +1870,106 @@ export function loadBlacklist(filePath = BLACKLIST_PATH) {
   return parseBlacklist(readFileSync(filePath, 'utf-8'));
 }
 
+// ── Title-reject log ────────────────────────────────────────────────
+//
+// Every scan throws away far more than it keeps — on one measured run, 6,499
+// of 8,289 postings were rejected on title alone. Only the count survived, in
+// scan-runs.tsv's filtered_title, which means the question that actually
+// matters ("is my keyword list missing something?") has no evidence behind it
+// and has to be answered by guessing synonyms.
+//
+// Recording the titles makes it derivable instead: the near-miss set is
+// (rejected titles) ∩ (vocabulary in cv.md) − (current positives). That
+// updates itself when the CV changes, with no keyword curation by hand.
+//
+// Deliberately records the FACT, not the reason. Which negative keyword
+// rejected a title is recomputable offline from portals.yml by whatever reads
+// this — paying for it inside the hot loop, 6,499 times a scan, buys nothing.
+
+const SCAN_REJECTS_PATH = process.env.CAREER_OPS_SCAN_REJECTS || 'data/scan-rejects.tsv';
+export const SCAN_REJECTS_HEADER = 'title\tcompany\tsource\tlast_seen\ttimes_seen\n';
+
+// Distinct titles worth keeping. The near-miss analysis cares about the variety
+// of language the market uses, not how often one posting reappears — so the log
+// is deduped by title and capped rather than being an append-only stream that
+// grows by thousands per scan.
+const SCAN_REJECTS_CAP = 5000;
+
+const rejectBuffer = new Map(); // normalized title → row
+
+/** Buffer one rejected title. Cheap by design: called in the scan's hot loop. */
+export function recordTitleReject(title, company = '', source = '') {
+  const t = (title || '').trim();
+  if (!t) return;
+  const key = t.toLowerCase().replace(/\s+/g, ' ');
+  const prev = rejectBuffer.get(key);
+  if (prev) { prev.times += 1; return; }
+  rejectBuffer.set(key, { title: t, company: company || '', source: source || '', times: 1 });
+}
+
+export function rejectBufferSize() { return rejectBuffer.size; }
+
+/**
+ * Merge the buffer into the log and write once, at the end of a scan.
+ *
+ * Merged rather than overwritten so vocabulary seen in earlier scans is not
+ * lost when a later scan happens to use narrower sources. Newest-first on
+ * last_seen, then truncated — an old title that stopped appearing is the first
+ * thing to drop.
+ */
+export function flushTitleRejects(filePath = SCAN_REJECTS_PATH, now = new Date()) {
+  if (rejectBuffer.size === 0) return 0;
+  const stamp = now.toISOString().slice(0, 10);
+  const rows = new Map();
+
+  try {
+    if (existsSync(filePath)) {
+      const lines = readFileSync(filePath, 'utf-8').split('\n').filter((l) => l.trim());
+      for (const line of lines.slice(1)) {
+        const [title, company, source, lastSeen, times] = line.split('\t');
+        if (!title) continue;
+        rows.set(title.toLowerCase().replace(/\s+/g, ' '), {
+          title, company: company || '', source: source || '',
+          lastSeen: lastSeen || '', times: Number(times) || 1,
+        });
+      }
+    }
+  } catch {
+    // Unreadable log → start fresh rather than losing this scan's evidence too.
+  }
+
+  for (const [key, r] of rejectBuffer) {
+    const prev = rows.get(key);
+    rows.set(key, {
+      title: r.title,
+      company: r.company || prev?.company || '',
+      source: r.source || prev?.source || '',
+      lastSeen: stamp,
+      times: (prev?.times || 0) + r.times,
+    });
+  }
+  rejectBuffer.clear();
+
+  const sorted = [...rows.values()]
+    .sort((a, b) => (b.lastSeen || '').localeCompare(a.lastSeen || '') || b.times - a.times)
+    .slice(0, SCAN_REJECTS_CAP);
+
+  try {
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    // Tabs and newlines in a scraped title would shear the columns.
+    const clean = (s) => String(s).replace(/[\t\r\n]+/g, ' ').trim();
+    writeFileSync(
+      filePath,
+      SCAN_REJECTS_HEADER + sorted.map((r) => [clean(r.title), clean(r.company), clean(r.source), r.lastSeen, r.times].join('\t')).join('\n') + '\n',
+      'utf-8',
+    );
+  } catch {
+    // Best-effort: failing to log rejects must never fail the scan itself.
+    return 0;
+  }
+  return sorted.length;
+}
+
 // ── Scan-run persistence (#1604) ────────────────────────────────────
 
 const SCAN_RUNS_PATH = 'data/scan-runs.tsv';
@@ -2391,6 +2491,7 @@ async function main() {
 
         if (!titleFilter(job.title)) {
           totalFilteredTitle++;
+          recordTitleReject(job.title, company.name, sourceName);
           continue;
         }
         if (classifyTier && skipTiers.includes(classifyTier(job.title))) {
@@ -2758,6 +2859,10 @@ async function main() {
       filteredPostedDate: totalFilteredPostedDate,
       filteredCountryEligibility: totalFilteredCountryEligibility,
     });
+    // Written once, at the end — the recorder buffers in memory so the hot loop
+    // never touches disk. Guarded with the other writes: a --dry-run must leave
+    // no trace.
+    flushTitleRejects();
   }
 
   console.log(`\n→ Run /career-ops pipeline to evaluate new offers.`);
