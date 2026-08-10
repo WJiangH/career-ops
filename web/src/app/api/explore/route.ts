@@ -46,16 +46,35 @@ export async function POST(req: NextRequest) {
           /* stream closed */
         }
       };
+      // Wire budget matters here in a way it does not on localhost. Over
+      // Tailscale the phone reaches this through a DERP relay on cellular, and
+      // `tailscale serve` speaks HTTP/2 — every request shares one TCP
+      // connection. A megabyte of scan chatter with any packet loss stalls that
+      // connection head-of-line, so the health check and the job poll queue
+      // behind it and the app declares the Mac unreachable while it is happily
+      // serving in 40ms. Measured on one sweep: 1,047KB total, of which
+      // `log` was 308KB (29%) with no client handler at all — the UI never
+      // reads them — and the `done` frame repeated all 1,420 offers for
+      // another 340KB (33%) that the client also ignores, since it accumulates
+      // from the individual `offer` events. Dropping both is a 62% cut with no
+      // behaviour change.
+      const sendToClient = (e: ScanEvent) => {
+        if (e.kind === "log") return;
+        send(e);
+      };
       send({ kind: "start", ats: filters.ats, sinceDays: filters.sinceDays, limit: filters.limitPerAts, free: true } satisfies ScanEvent);
       let offers: DiscoveredOffer[] = [];
       try {
-        offers = await runDiscovery(filters, (e: ScanEvent) => send(e));
+        offers = await runDiscovery(filters, sendToClient);
       } catch (err) {
         send({ kind: "error", message: err instanceof Error ? err.message : "discovery failed" } satisfies ScanEvent);
       }
       const done = { kind: "done", count: offers.length, offers, cost: { tokens: 0, usd: 0 } } satisfies ScanEvent;
+      // Persist the FULL result — the recovery path in /api/explore/last is the
+      // one consumer that genuinely needs the offers, and it reads from disk.
       saveLastDiscovery({ runId, finishedAt: Date.now(), event: done });
-      send(done);
+      // …but put a slim frame on the wire.
+      send({ ...done, offers: [] });
       controller.close();
     },
   });
