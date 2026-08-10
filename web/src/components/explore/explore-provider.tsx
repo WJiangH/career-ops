@@ -169,6 +169,9 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
       window.history.replaceState(null, "", `/explore${qs ? `?${qs}` : ""}`);
     }
 
+    // Minted before the request so the result stays addressable even if this
+    // client never sees the stream close.
+    const runId = `scan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const acc: DiscoveredOffer[] = [];
     let sawError = "";
     let companiesScannedAcc = 0; // 0 at the end = the directories never downloaded → degraded, not empty
@@ -179,7 +182,9 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
       const r = await fetch("/api/explore", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(f),
+        // runId lets us claim this sweep's result if the stream dies — without
+        // it we could adopt the previous scan's offers and believe they were ours.
+        body: JSON.stringify({ ...f, runId }),
       });
       if (r.status === 400) {
         const d = await r.json().catch(() => ({}));
@@ -252,6 +257,26 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
       }
     } catch (e) {
       sawError = e instanceof Error ? e.message : "stream error";
+      // Backgrounding the PWA cancels the fetch, but the sweep runs to
+      // completion on the Mac — the answer exists, only the pipe is gone.
+      // Collect it instead of reporting a failure that did not happen.
+      // ~2 min of polling covers a full multi-ATS sweep; past that the real
+      // error stands.
+      for (let i = 0; i < 60 && acc.length === 0; i++) {
+        await new Promise((res) => setTimeout(res, 2000));
+        try {
+          const lr = await fetch(`/api/explore/last?runId=${encodeURIComponent(runId)}`, { cache: "no-store" });
+          if (!lr.ok) continue;
+          const payload = (await lr.json()) as { ready?: boolean; event?: { offers?: DiscoveredOffer[] } };
+          if (!payload.ready) continue;
+          const recovered = payload.event?.offers ?? [];
+          if (recovered.length > 0) acc.push(...recovered);
+          sawError = "";
+          break;
+        } catch {
+          /* still unreachable — the connection banner explains why; keep waiting */
+        }
+      }
     }
 
     // Mark any still-active sources as swept (stream ended).

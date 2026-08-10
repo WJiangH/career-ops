@@ -1,4 +1,5 @@
 import { NextRequest } from "next/server";
+import { saveLastDiscovery } from "@/lib/core/last-discovery";
 import fs from "node:fs";
 import { runDiscovery } from "@/lib/core/scan";
 import { rootScript } from "@/lib/career-ops";
@@ -28,6 +29,13 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // Discovery is a query that yields a result set, not a stream of side
+  // effects — so the result is worth keeping. Backgrounding the PWA cancels the
+  // fetch, and until now that lost a scan that had already finished server-side
+  // ("Couldn't finish the search. Load failed"). The sweep still runs to
+  // completion; persisting it lets a returning client collect the answer.
+  const runId = typeof (body as { runId?: unknown }).runId === "string" ? (body as { runId: string }).runId : null;
+
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
@@ -45,7 +53,9 @@ export async function POST(req: NextRequest) {
       } catch (err) {
         send({ kind: "error", message: err instanceof Error ? err.message : "discovery failed" } satisfies ScanEvent);
       }
-      send({ kind: "done", count: offers.length, offers, cost: { tokens: 0, usd: 0 } } satisfies ScanEvent);
+      const done = { kind: "done", count: offers.length, offers, cost: { tokens: 0, usd: 0 } } satisfies ScanEvent;
+      saveLastDiscovery({ runId, finishedAt: Date.now(), event: done });
+      send(done);
       controller.close();
     },
   });
