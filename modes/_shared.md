@@ -148,7 +148,22 @@ When a JD publishes a salary figure, distinguish advertised range, likely guaran
 
 ## Archetype Detection
 
-Classify every offer into one of these types (or hybrid of 2):
+Classify the offer by archetype. `modes/_profile.md` → *Your Target Roles* is
+authoritative: where it defines archetypes, detect against **that** table and
+use the one below only as a fallback for what it does not cover. This mirrors
+the precedence already stated above — user customizations in `_profile.md`
+override the defaults in this file.
+
+The table below is a default, not a closed set. It reflects one particular
+search (see AGENTS.md → Origin) and will not describe every user's field: a
+silicon design-verification engineer, a quant, a clinician have no archetype
+here at all.
+
+**If an offer matches no archetype the user actually targets, say so plainly
+and score North Star alignment low.** That is a real and useful signal.
+Forcing it into the nearest available label — or into a "hybrid" of two —
+manufactures a confident fit narrative for a job the user is not applying for,
+which is worse than a low score because it reads as analysis.
 
 | Archetype | Key signals in JD |
 |-----------|-------------------|
