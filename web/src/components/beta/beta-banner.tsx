@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Bug, X, ShieldCheck, ThumbsUp, Search, Loader2 } from "lucide-react";
+import { cn } from "@/lib/cn";
 import { collect, fingerprint, issueBody, issueUrl, type Diag } from "@/lib/report/report";
 import "@/lib/report/logbuf"; // install the client error ring-buffer (side-effect)
 
@@ -86,11 +87,39 @@ export function BetaBanner() {
     });
   };
 
+  // Scroll-direction tracking for the mobile auto-hide above. A small threshold
+  // keeps rubber-band bounce and one-pixel jitter from flickering the pill.
+  const [hidden, setHidden] = useState(false);
+  const lastY = useRef(0);
+  useEffect(() => {
+    const onScroll = () => {
+      const y = window.scrollY;
+      if (Math.abs(y - lastY.current) < 8) return;
+      setHidden(y > lastY.current && y > 80);
+      lastY.current = y;
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
   if (!meta) return null;
+
+  // On a phone this pill sits on top of whatever is at the bottom of the
+  // viewport — it covered a card's Skip button and a verdict's "Full report"
+  // link, both unreachable. Page padding cannot help: the pill is fixed, so it
+  // obstructs mid-scroll too. Slide it out while scrolling down and bring it
+  // back on scroll up, the standard mobile chrome behaviour. Desktop keeps it
+  // pinned; there is no shortage of room there.
 
   return (
     <>
-      <div className="fixed bottom-3 left-3 z-[70] flex items-center gap-2 rounded-full border border-brand/30 bg-surface/90 px-3 py-1.5 text-xs shadow-lg backdrop-blur-md">
+      <div
+        className={cn(
+          "fixed bottom-3 left-3 z-[70] flex items-center gap-2 rounded-full border border-brand/30 bg-surface/90 px-3 py-1.5 text-xs shadow-lg backdrop-blur-md",
+          "transition-transform duration-200 motion-reduce:transition-none",
+          hidden ? "max-md:translate-y-[calc(100%+1.5rem)]" : "translate-y-0",
+        )}
+      >
         <span className="flex items-center gap-1.5 font-medium text-brand-text">
           <span className="size-1.5 animate-pulse rounded-full bg-brand" /> {meta.version} · {meta.channel}
         </span>

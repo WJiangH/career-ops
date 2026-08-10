@@ -189,8 +189,60 @@ export function PipelineView({
           <InboxEmpty count={0} filtered={false} />
         )
       ) : filtered.length > 0 ? (
-        /* ── Tracker table ── */
-        <div className="mt-4 overflow-hidden rounded-2xl border border-border">
+        /* ── Tracker ──
+           Two presentations, not one with breakpoints. A five-column table and
+           a stacked card are genuinely different layouts: at 390px the table
+           gave every column ~70px, so role titles wrapped to four lines and the
+           header — which is also the only sort control — was unusable. Switched
+           by CSS rather than a JS device check, which would desync on hydrate. */
+        <>
+        {/* Sort, for the phone: the desktop affordance is the table header. */}
+        <div className="mt-4 flex items-center gap-2 overflow-x-auto pb-1 md:hidden">
+          <span className="shrink-0 text-xs text-faint">Sort</span>
+          {SORT_KEYS.map((k) => (
+            <button
+              key={k}
+              onClick={() => setParams({ sort: k, dir: sort.key === k ? sort.dir * -1 : -1 })}
+              className={cn(
+                "shrink-0 rounded-full border px-3 py-1.5 text-xs capitalize transition-colors",
+                sort.key === k ? "border-brand/40 bg-brand-soft text-brand" : "border-border text-muted",
+              )}
+            >
+              {k}
+              {sort.key === k && <span className="ml-1">{sort.dir === -1 ? "↓" : "↑"}</span>}
+            </button>
+          ))}
+        </div>
+
+        <ul className="mt-3 space-y-2 md:hidden">
+          {filtered.map((r, i) => (
+            <li key={`m-${r.n}-${i}`}>
+              {/* Whole card is the tap target — 44px minimum comes free from the
+                  padding, and there is no hover state to rely on on a phone. */}
+              <Link
+                href={`/pipeline/${r.n}`}
+                className="block rounded-2xl border border-border bg-surface/30 p-4 active:bg-surface/60"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <CompanyLogo name={r.company} size={20} />
+                    <span className="truncate font-medium">{r.company}</span>
+                  </div>
+                  <Badge tone={scoreTone(r.score)}>{r.score || "—"}</Badge>
+                </div>
+                <p className="mt-1.5 line-clamp-2 text-sm text-muted">{r.role}</p>
+                <div className="mt-2.5 flex items-center gap-2 text-xs text-faint">
+                  <span className={cn("size-1.5 shrink-0 rounded-full", statusDot(r.status))} />
+                  <span>{r.status}</span>
+                  <span aria-hidden>·</span>
+                  <span className="tabular-nums">{r.date}</span>
+                </div>
+              </Link>
+            </li>
+          ))}
+        </ul>
+
+        <div className="mt-4 hidden overflow-hidden rounded-2xl border border-border md:block">
           <table className="w-full text-sm">
             <thead className="bg-surface/60 text-left text-xs uppercase tracking-wide text-faint">
               <tr>
@@ -235,6 +287,7 @@ export function PipelineView({
             </tbody>
           </table>
         </div>
+        </>
       ) : (
         <div className="mt-4 rounded-2xl border border-dashed border-border bg-surface/30 px-6 py-12 text-center">
           <p className="font-display text-lg">No matches</p>
