@@ -70,7 +70,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </div>
           </div>
         </aside>
-        <main className="flex-1 overflow-x-hidden">{children}</main>
+        {/* pb-24 clears the fixed beta banner and Ask button (both bottom-3).
+            Without it they sit on top of whatever ends the page — on a phone
+            that was the "Full report" link closing a verdict card, unreachable
+            behind the "Report a bug" pill. */}
+        <main className="flex-1 overflow-x-hidden pb-24">{children}</main>
         <AssistantConsole />
         <FirstScoreView />
         <BetaBanner />

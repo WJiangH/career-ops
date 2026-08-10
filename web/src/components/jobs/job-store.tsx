@@ -113,6 +113,28 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
   // from the Mac, or from this phone before its localStorage was cleared) and
   // settle anything we still think is running. Polls only while something is in
   // flight, so an idle dashboard is silent.
+  // Rebuild a job's step trace and text from the durable transcript. Used when
+  // a run completed (or started) without this client attached: the server has
+  // the whole story, the browser has a stub.
+  const hydrate = useCallback(async (id: string) => {
+    try {
+      const r = await fetch(`/api/jobs/${id}/events?from=0`, { cache: "no-store" });
+      if (!r.ok) return;
+      const { events } = (await r.json()) as { events: Array<{ type?: string; name?: string; label?: string; text?: string }> };
+      const steps: JobStep[] = [];
+      let text = "";
+      for (const ev of events) {
+        if (ev.type === "tool") steps.push({ kind: "tool", label: ev.name!, ts: Date.now() });
+        else if (ev.type === "status") steps.push({ kind: "status", label: ev.label!, ts: Date.now() });
+        else if (ev.type === "text") text = (text + ev.text).slice(-8000);
+      }
+      if (steps.length === 0 && !text) return;
+      setJobs((js) => js.map((j) => (j.id === id ? { ...j, steps: steps.length ? steps : j.steps, text: text || j.text } : j)));
+    } catch {
+      /* offline — the record on disk is unaffected, next open will hydrate */
+    }
+  }, []);
+
   useEffect(() => {
     let stop = false;
     const tick = async () => {
@@ -139,10 +161,15 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
               steps: [{ kind: "status", label: "Rejoined — started elsewhere", ts: Date.now() }],
               text: "", startedAt: sj.startedAt,
             } as Job);
+            void hydrate(sj.id);
             changed = true;
           } else if (local.status === "running" && sj.status !== "running") {
             byId.set(sj.id, { ...local, status: sj.status === "error" ? "error" : "done", endedAt: Date.now(), tldr: sj.tldr ?? local.tldr,
               steps: [...local.steps, { kind: "status", label: sj.summary || "Finished", ts: Date.now() }] });
+            // Settled while we were away, so this client never saw the tool
+            // trace — 35 events in the log against two on screen. Replay it
+            // once, here, rather than on every tick.
+            void hydrate(sj.id);
             changed = true;
           } else if (sj.tldr && !local.tldr) {
             // The client finished the stream itself, so the branch above never
@@ -158,7 +185,7 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
     void tick();
     const iv = setInterval(() => { if (!stop) void tick(); }, 5000);
     return () => { stop = true; clearInterval(iv); };
-  }, []);
+  }, [hydrate]);
 
   const startJob = useCallback(
     (opts: StartOpts): string | null => {
