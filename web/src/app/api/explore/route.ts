@@ -58,8 +58,16 @@ export async function POST(req: NextRequest) {
       // another 340KB (33%) that the client also ignores, since it accumulates
       // from the individual `offer` events. Dropping both is a 62% cut with no
       // behaviour change.
+      // The summary carries what the UI needs to explain an empty result —
+      // companiesScanned, capHit, datasetStatus. It arrives near the very end,
+      // so a client whose stream died never sees it, and its absence reads as
+      // companiesScanned === 0 → "couldn't reach any sources", which is a
+      // different and much more alarming claim than the truth ("capped at 600
+      // of 15,862"). Stash it so the recovery path can restore it too.
+      let summary: ScanEvent | null = null;
       const sendToClient = (e: ScanEvent) => {
         if (e.kind === "log") return;
+        if (e.kind === "summary") summary = e;
         send(e);
       };
       send({ kind: "start", ats: filters.ats, sinceDays: filters.sinceDays, limit: filters.limitPerAts, free: true } satisfies ScanEvent);
@@ -72,7 +80,7 @@ export async function POST(req: NextRequest) {
       const done = { kind: "done", count: offers.length, offers, cost: { tokens: 0, usd: 0 } } satisfies ScanEvent;
       // Persist the FULL result — the recovery path in /api/explore/last is the
       // one consumer that genuinely needs the offers, and it reads from disk.
-      saveLastDiscovery({ runId, finishedAt: Date.now(), event: done });
+      saveLastDiscovery({ runId, finishedAt: Date.now(), event: done, summary });
       // …but put a slim frame on the wire.
       send({ ...done, offers: [] });
       controller.close();

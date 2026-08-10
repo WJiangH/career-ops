@@ -271,10 +271,29 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
         try {
           const lr = await fetch(`/api/explore/last?runId=${encodeURIComponent(runId)}`, { cache: "no-store" });
           if (!lr.ok) continue;
-          const payload = (await lr.json()) as { ready?: boolean; event?: { offers?: DiscoveredOffer[] } };
+          const payload = (await lr.json()) as {
+            ready?: boolean;
+            event?: { offers?: DiscoveredOffer[] };
+            summary?: { companiesScanned?: number; companiesAvailable?: number; capHit?: boolean; droppedNoDate?: number } | null;
+          };
           if (!payload.ready) continue;
           const recovered = payload.event?.offers ?? [];
           if (recovered.length > 0) acc.push(...recovered);
+          // Restore the summary too. It arrives at the very end of the stream,
+          // so a client that dropped never saw it — and its absence is read as
+          // companiesScanned === 0, which renders "couldn't reach any sources".
+          // That is a far more alarming claim than the truth, which is usually
+          // "capped at 600 of 15,862 companies".
+          const sum = payload.summary;
+          if (sum) {
+            if (typeof sum.companiesScanned === "number") {
+              companiesScannedAcc = sum.companiesScanned;
+              setCompaniesScanned(sum.companiesScanned);
+            }
+            if (typeof sum.companiesAvailable === "number") setCompaniesAvailable(sum.companiesAvailable);
+            if (sum.capHit) capHitAcc = true;
+            if (typeof sum.droppedNoDate === "number") droppedNoDateAcc = sum.droppedNoDate;
+          }
           sawError = "";
           break;
         } catch {

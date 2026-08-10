@@ -19,6 +19,13 @@ export interface LastDiscovery {
   runId: string | null;
   finishedAt: number;
   event: unknown;
+  /**
+   * The scan's summary event. Recovered alongside the offers because without it
+   * the UI cannot tell "capped at 600 of 15,862" from "reached nothing at all",
+   * and defaults to the latter — the most alarming reading of a scan that
+   * worked fine.
+   */
+  summary?: unknown;
 }
 
 function file(): string {

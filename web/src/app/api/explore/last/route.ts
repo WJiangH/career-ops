@@ -15,7 +15,7 @@ export async function GET(req: Request) {
     return NextResponse.json({ ready: false }, { headers: { "Cache-Control": "no-store" } });
   }
   return NextResponse.json(
-    { ready: true, finishedAt: last.finishedAt, event: last.event },
+    { ready: true, finishedAt: last.finishedAt, event: last.event, summary: last.summary ?? null },
     { headers: { "Cache-Control": "no-store" } },
   );
 }
