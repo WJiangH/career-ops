@@ -7,6 +7,7 @@ import { resolvePdfPaths, type PdfPaths } from "@/lib/pdf-paths.mjs";
 import { renderAndMarkPdf } from "@/lib/pdf-render.mjs";
 import { acquireTrackerWrite, releaseTrackerWrite } from "@/lib/core/run-registry";
 import { appendEvent, createJob, finishJob } from "@/lib/core/job-log";
+import { newReportSince, readMachineSummary, snapshotReports } from "@/lib/machine-summary.mjs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -187,6 +188,9 @@ export async function POST(req: Request) {
   };
   const persists = kind === "evaluate";
   const reportsBefore = persists ? countReports() : 0;
+  // Names, not just a count: identifying the new report by set difference is
+  // concurrency-safe, where "newest mtime" would hand one run another's report.
+  const reportNamesBefore = persists ? snapshotReports(careerOpsRoot()) : new Set<string>();
   // Tracker-mutating runs hold a write token so a row delete can't race their merge
   // (tracker.mjs delete doesn't yet share a lock with merge-tracker — see run-registry).
   const writeToken = kind === "evaluate" || kind === "pdf" ? acquireTrackerWrite() : null;
@@ -279,7 +283,7 @@ export async function POST(req: Request) {
         if (closed || clientGone) return;
         try { controller.enqueue(enc.encode(JSON.stringify(obj) + "\n")); } catch { clientGone = true; }
       };
-      const close = (outcome?: { status: "done" | "error"; summary?: string }) => {
+      const close = (outcome?: { status: "done" | "error"; summary?: string; tldr?: Record<string, unknown> }) => {
         if (!closed) {
           closed = true;
           if (killer) clearTimeout(killer);
@@ -291,6 +295,7 @@ export async function POST(req: Request) {
               : terminalSummary || undefined),
             tokens: lastTokens,
             costUsd: lastCostUsd,
+            ...(outcome?.tldr ? { tldr: outcome.tldr } : {}),
           });
           try { controller.close(); } catch { /* */ }
         }
@@ -444,6 +449,17 @@ export async function POST(req: Request) {
           send({ type: "error", msg: "This run hit an error before finishing, so it isn't recorded as a confident result — re-run it to verify." });
         } else {
           send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd });
+          if (persists) {
+            const rel = newReportSince(careerOpsRoot(), reportNamesBefore);
+            const tldr = rel ? readMachineSummary(careerOpsRoot(), rel) : null;
+            if (tldr) {
+              // The product of the run, captured before close() writes the
+              // record — so /api/jobs alone can render a verdict without the
+              // client having to go read markdown.
+              close({ status: "done", tldr });
+              return;
+            }
+          }
         }
         close();
       });

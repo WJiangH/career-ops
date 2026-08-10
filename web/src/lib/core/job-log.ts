@@ -32,6 +32,12 @@ export interface JobMeta {
   costUsd?: number | null;
   /** Final one-line outcome — the verdict for an evaluation, or the error. */
   summary?: string;
+  /**
+   * The report's own Machine Summary, parsed server-side the moment the run
+   * finishes. Stored here rather than fetched on demand so a client that was
+   * away for the whole run still gets the verdict from a plain /api/jobs read.
+   */
+  tldr?: Record<string, unknown>;
 }
 
 function jobsDir(): string {

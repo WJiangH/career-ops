@@ -76,13 +76,72 @@ export default function JobPage({ params }: { params: Promise<{ id: string }> })
         )}
       </ol>
 
-      {job.text && (
+      {/* The verdict, when the run produced one. The agent writes its real
+          output to reports/{num}-{slug}-{date}.md and only narrates on the
+          stream, so showing the stream tail as "Output" surfaced running
+          commentary ("Now let's release the reservation, write the tracker TSV,
+          and merge.") in place of the actual result. */}
+      {job.tldr && (
         <div className="mt-8">
-          <h2 className="text-xs font-semibold uppercase tracking-[0.2em] text-muted">Output</h2>
+          <h2 className="text-xs font-semibold uppercase tracking-[0.2em] text-muted">Verdict</h2>
+          <div className="mt-3 rounded-2xl border border-border bg-surface/40 p-5">
+            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+              {typeof job.tldr.score === "number" && (
+                <span className="text-2xl font-semibold tabular-nums">{job.tldr.score.toFixed(1)}<span className="text-base text-muted">/5</span></span>
+              )}
+              {job.tldr.final_decision && (
+                <span className="rounded-full border border-border px-2.5 py-0.5 text-xs font-medium uppercase tracking-wide">{job.tldr.final_decision}</span>
+              )}
+              {job.tldr.work_auth && job.tldr.work_auth !== "unstated" && (
+                <span className="text-xs text-muted">work auth: {job.tldr.work_auth}</span>
+              )}
+            </div>
+            {(job.tldr.company || job.tldr.role) && (
+              <p className="mt-1 text-sm text-muted">{[job.tldr.company, job.tldr.role].filter(Boolean).join(" · ")}</p>
+            )}
+            {job.tldr.next_action && <p className="mt-4 text-sm leading-relaxed">{job.tldr.next_action}</p>}
+
+            {[
+              { label: "Blockers", items: job.tldr.hard_stops },
+              { label: "Gaps", items: job.tldr.soft_gaps },
+              { label: "Strengths", items: job.tldr.top_strengths },
+            ].map(({ label, items }) =>
+              items && items.length > 0 ? (
+                <div key={label} className="mt-4">
+                  <h3 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-faint">{label}</h3>
+                  <ul className="mt-1.5 space-y-1.5">
+                    {items.map((t, i) => (
+                      <li key={i} className="flex gap-2 text-sm leading-relaxed text-muted">
+                        <span className="text-faint">—</span>
+                        <span>{t}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null,
+            )}
+
+            {job.tldr.report && (
+              <p className="mt-5 text-sm">
+                <a className="text-brand underline underline-offset-4" href={`/pipeline`}>Full report · {job.tldr.report.replace("reports/", "")}</a>
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Narration stays available, but demoted: it is how the run went, not
+          what it produced. Open by default only when there is no verdict to
+          show — a failed or still-running job, where it is the only signal. */}
+      {job.text && (
+        <details className="mt-8" open={!job.tldr}>
+          <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.2em] text-muted">
+            {job.tldr ? "Agent log" : "Output"}
+          </summary>
           <div className="report-prose mt-3 rounded-2xl border border-border bg-surface/40 p-5">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{job.text}</ReactMarkdown>
           </div>
-        </div>
+        </details>
       )}
     </div>
   );

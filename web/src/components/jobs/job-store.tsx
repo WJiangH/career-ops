@@ -6,6 +6,20 @@ import { scoreTone } from "@/lib/format";
 export type JobStep = { kind: "tool" | "status"; label: string; ts: number };
 export type JobResult = { score: number | null; summary: string; tone: "good" | "warn" | "bad" | "muted" };
 
+/**
+ * The report's own `## Machine Summary` — structured, not prose. Parsed
+ * server-side when the run finishes, so it reaches a client that was away for
+ * the whole thing. This is what a finished evaluation should show; the text
+ * stream only ever carried the agent's inter-tool narration.
+ */
+export type JobTldr = {
+  company?: string; role?: string; score?: number; archetype?: string;
+  final_decision?: string; legitimacy_tier?: string; work_auth?: string;
+  risk_level?: string; confidence?: string; next_action?: string;
+  hard_stops?: string[]; soft_gaps?: string[]; top_strengths?: string[];
+  report?: string;
+};
+
 export type Job = {
   id: string;
   title: string;
@@ -21,6 +35,7 @@ export type Job = {
   cost?: { tokens: number; usd?: number }; // per-run token cost (Claude result event) — local only
   startedAt: number;
   endedAt?: number;
+  tldr?: JobTldr;
 };
 
 type StartOpts = { title: string; subtitle?: string; kind: string; input: string; page?: string; batchId?: string };
@@ -101,7 +116,7 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let stop = false;
     const tick = async () => {
-      let serverJobs: Array<{ id: string; kind: string; input: string; title?: string; status: string; startedAt: number; summary?: string }>;
+      let serverJobs: Array<{ id: string; kind: string; input: string; title?: string; status: string; startedAt: number; summary?: string; tldr?: JobTldr }>;
       try {
         const r = await fetch("/api/jobs", { cache: "no-store" });
         if (!r.ok) return;
@@ -126,8 +141,14 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
             } as Job);
             changed = true;
           } else if (local.status === "running" && sj.status !== "running") {
-            byId.set(sj.id, { ...local, status: sj.status === "error" ? "error" : "done", endedAt: Date.now(),
+            byId.set(sj.id, { ...local, status: sj.status === "error" ? "error" : "done", endedAt: Date.now(), tldr: sj.tldr ?? local.tldr,
               steps: [...local.steps, { kind: "status", label: sj.summary || "Finished", ts: Date.now() }] });
+            changed = true;
+          } else if (sj.tldr && !local.tldr) {
+            // The client finished the stream itself, so the branch above never
+            // fired; the verdict still has to arrive from the server, which is
+            // the only side that parses the report.
+            byId.set(sj.id, { ...local, tldr: sj.tldr });
             changed = true;
           }
         }
