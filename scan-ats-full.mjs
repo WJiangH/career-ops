@@ -43,7 +43,7 @@ import lever from './providers/lever.mjs';
 import ashby from './providers/ashby.mjs';
 import workday from './providers/workday.mjs';
 import icims from './providers/icims.mjs';
-import { buildTitleFilter, buildLocationFilter, buildContentFilter, matchedTitleKeywords, loadSeenUrls, normalizeUrlForDedup, appendToPipeline, appendToScanHistory, loadBlacklist, parseSinceDays } from './scan.mjs';
+import { buildTitleFilter, buildLocationFilter, buildContentFilter, matchedTitleKeywords, recordTitleReject, flushTitleRejects, loadSeenUrls, normalizeUrlForDedup, appendToPipeline, appendToScanHistory, loadBlacklist, parseSinceDays } from './scan.mjs';
 import { SEED_SOURCES, toPortalEntry } from './seeds/vc-portfolios.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
 
@@ -397,7 +397,14 @@ export function filterBlacklistedOffers(offers, blacklist, { includeBlacklisted 
 // (#1846) unit-testable without mocking providers or duplicating the rule
 // order in two places for the caller that doesn't need per-stage counts.
 export function passesFilters(job, { titleFilter, locationFilter, contentFilter, titleFilterConfig }) {
-  if (!titleFilter(job.title)) return false;
+  if (!titleFilter(job.title)) {
+    // Both title-reject sites record: this pure helper serves the legacy path
+    // while the loop below has its own inline check for the per-stage counters.
+    // Patching only one left the log empty on the path the scanner actually
+    // takes, which is exactly the kind of silence this log exists to end.
+    recordTitleReject(job.title, job.company, job.source);
+    return false;
+  }
   // job.url is passed so the location filter can fall back to the URL's own
   // location segment when the provider reports a rolled-up "N Locations" string;
   // job.title so a title-stated remote role survives a city-only location.
@@ -717,7 +724,7 @@ async function main() {
       }
       if (dateClass === 'stale') continue;
       if (dateClass === 'undated' && !opts.includeUndated) { droppedNoDate++; continue; }
-      if (!titleFilter(job.title)) continue;
+      if (!titleFilter(job.title)) { recordTitleReject(job.title, job.company, job.source || ats); continue; }
       // job.url is passed so the location filter can fall back to the URL's own
       // location segment when the provider reports a rolled-up "N Locations" string;
       // job.title so a title-stated remote role survives a city-only location.
@@ -1057,8 +1064,21 @@ async function main() {
 
 // Only run main() when invoked directly, not when imported by tests.
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  main().catch(err => {
-    console.error('Fatal:', err.message);
-    process.exit(1);
-  });
+  main()
+    .catch(err => {
+      console.error('Fatal:', err.message);
+      process.exitCode = 1;
+    })
+    // Covers every exit path — main() has several early returns, and a crash
+    // partway through a sweep still leaves rejects worth keeping.
+    //
+    // Deliberately NOT guarded by --dry-run, unlike the pipeline and
+    // scan-history writes. That guard exists so a rehearsal never adds work to
+    // the user's queue or claims results it did not save; a bounded diagnostic
+    // file under data/ does neither. Guarding it would also leave the log empty
+    // on the surface most scans come from — the web Explorer always passes
+    // --dry-run.
+    .finally(() => {
+      try { flushTitleRejects(); } catch { /* never fail a scan over its own telemetry */ }
+    });
 }
