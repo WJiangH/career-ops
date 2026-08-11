@@ -117,7 +117,7 @@ export function PipelineView({
   }, [applications, tab, q, sort, minFilter]);
 
   return (
-    <div className="mx-auto max-w-6xl px-6 py-8 max-sm:pb-24">
+    <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8 max-sm:pb-24">
       <div className="flex items-end justify-between gap-4">
         <div>
           <h1 className="font-display text-2xl tracking-tight text-landing">Pipeline</h1>
@@ -242,14 +242,19 @@ export function PipelineView({
           ))}
         </ul>
 
-        <div className="mt-4 hidden overflow-hidden rounded-2xl border border-border md:block">
-          <table className="w-full text-sm">
+        {/* overflow-x-auto, not overflow-hidden (upstream #2363): the rounded
+            corners still clip, but a table wider than the viewport can be
+            scrolled to instead of being silently cut off. Still md:block —
+            below that the card list above replaces it entirely — but a narrow
+            desktop window clipped the same way, so the fix applies here too. */}
+        <div className="mt-4 hidden overflow-x-auto rounded-2xl border border-border md:block">
+          <table className="w-full min-w-[44rem] text-sm">
             <thead className="bg-surface/60 text-left text-xs uppercase tracking-wide text-faint">
               <tr>
                 {SORT_KEYS.map((k) => (
                   <th
                     key={k}
-                    className="cursor-pointer select-none px-4 py-2.5 font-medium hover:text-foreground"
+                    className="cursor-pointer select-none whitespace-nowrap px-4 py-2.5 font-medium hover:text-foreground"
                     onClick={() => setParams({ sort: k, dir: sort.key === k ? sort.dir * -1 : -1 })}
                   >
                     <span className="inline-flex items-center gap-1">
@@ -275,13 +280,13 @@ export function PipelineView({
                   <td className="px-4 py-3">
                     <Badge tone={scoreTone(r.score)}>{r.score || "—"}</Badge>
                   </td>
-                  <td className="px-4 py-3 text-muted">
+                  <td className="whitespace-nowrap px-4 py-3 text-muted">
                     <span className="inline-flex items-center gap-1.5">
                       <span className={cn("size-1.5 shrink-0 rounded-full", statusDot(r.status))} />
                       {r.status}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-faint tabular-nums">{r.date}</td>
+                  <td className="whitespace-nowrap px-4 py-3 text-faint tabular-nums">{r.date}</td>
                 </tr>
               ))}
             </tbody>
