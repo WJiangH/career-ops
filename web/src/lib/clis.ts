@@ -21,14 +21,6 @@ export type CliSpec = {
    * raw stdout, which displays fine but reports no token usage.
    */
   streamArgs?: (prompt: string) => string[];
-  /**
-   * stderr lines that are noise, not failure. The route treats any stderr
-   * matching /error|denied|auth|.../ as a real error — deliberately broad,
-   * because a silent auth failure is the worst outcome. Codex logs a benign
-   * `ERROR codex_models_manager::cache: failed to load models cache` on every
-   * run, which that rule reads as a failed run.
-   */
-  benignStderr?: RegExp;
   /** Args selecting a model. Absent when the CLI exposes no such flag. */
   modelArgs?: (model: string) => string[];
   /** Args selecting reasoning effort. */
@@ -52,7 +44,6 @@ export const KNOWN: CliSpec[] = [
     efforts: ["low", "medium", "high", "xhigh", "max"] },
   { id: "codex", name: "Codex", bin: "codex", run: "codex exec", url: "https://github.com/openai/codex", args: (p) => ["exec", p],
     streamArgs: (p) => ["exec", "--json", p],
-    benignStderr: /models cache|base_instructions/i,
     modelArgs: (m) => ["--model", m],
     // No dedicated flag: effort rides on the generic config override. An
     // unsupported value fails the turn with a 400 from the API, not locally.
