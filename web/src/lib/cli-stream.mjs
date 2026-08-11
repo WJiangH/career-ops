@@ -55,9 +55,14 @@ function n(v) {
 
 /** Argument keys worth showing, most specific first. Unknown tools fall through
  *  to no detail rather than printing a random field. */
+// `path` sits AFTER pattern/query on purpose. A search tool usually carries
+// both, and the interesting half is what was searched for, not where: "Using
+// grep career-ops/batch" says nothing, "Using grep Machine Summary" says why
+// the agent went looking. For read/write tools the file IS the subject, so
+// those keys stay first.
 const DETAIL_KEYS = [
-  'file_path', 'target_file', 'notebook_path', 'path',
-  'command', 'pattern', 'query', 'url', 'prompt',
+  'file_path', 'target_file', 'notebook_path',
+  'command', 'pattern', 'query', 'url', 'path', 'prompt',
 ];
 
 /** Absolute paths are mostly the user's home prefix. The tail carries the

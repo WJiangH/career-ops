@@ -223,8 +223,17 @@ test("detail: shell wrappers are unwrapped, single or double quoted", () => {
   assert.equal(describeToolInput({ command: "node scan.mjs --dry-run" }), "node scan.mjs --dry-run", "an unwrapped command is untouched");
 });
 
-test("detail: keys are tried in priority order", () => {
-  assert.equal(describeToolInput({ query: "q", file_path: "a/b.md" }), "a/b.md", "the path is more identifying than the query");
+test("detail: for a read, the file is the subject", () => {
+  assert.equal(describeToolInput({ query: "q", file_path: "a/b.md" }), "a/b.md");
+});
+
+test("detail: for a search, the pattern beats the path", () => {
+  // A grep carries both, and "Using grep career-ops/batch" says nothing about
+  // what the agent was hunting for. Observed on a real run: every grep line in
+  // the log showed a directory, never a term.
+  assert.equal(describeToolInput({ path: "career-ops/batch", pattern: "Machine Summary" }), "Machine Summary");
+  assert.equal(describeToolInput({ path: "modes/", query: "archetype" }), "archetype");
+  assert.equal(describeToolInput({ path: "only/a/path" }), "only/a/path", "still shown when it is all there is");
 });
 
 test("detail: long values are truncated with an ellipsis", () => {
