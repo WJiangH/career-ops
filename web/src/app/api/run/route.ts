@@ -2,12 +2,20 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveCli } from "@/lib/clis";
+import { parserFor } from "@/lib/cli-stream.mjs";
 import { careerOpsRoot, readMemory, findReportFile } from "@/lib/career-ops";
 import { resolvePdfPaths, type PdfPaths } from "@/lib/pdf-paths.mjs";
 import { renderAndMarkPdf } from "@/lib/pdf-render.mjs";
 import { acquireTrackerWrite, releaseTrackerWrite } from "@/lib/core/run-registry";
 import { appendEvent, createJob, finishJob } from "@/lib/core/job-log";
 import { newReportSince, readMachineSummary, snapshotReports } from "@/lib/machine-summary.mjs";
+
+/** The normalized shape cli-stream.mjs parsers emit, whatever the CLI's dialect. */
+type StreamEvent =
+  | { type: "text"; text: string }
+  | { type: "tool"; name: string }
+  | { type: "status"; label: string }
+  | { type: "usage"; tokens: number; costUsd: number | null };
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -153,6 +161,7 @@ export async function POST(req: Request) {
   const prompt = buildPrompt({ kind, input, memory: readMemory(), today, pdfPaths });
 
   const isClaude = cliId === "claude";
+  const parseEvent = parserFor(cliId);
   // Tool scope by kind (comma-separated lists; disallowedTools is the hard
   // guardrail). 'evaluate'/'fix-portal' run the REAL mode + persist canonical
   // artifacts → they need Write + Bash (reserve-report-num / merge-tracker /
@@ -169,12 +178,19 @@ export async function POST(req: Request) {
       : kind === "pdf"
         ? { allowed: "Read,WebFetch,WebSearch,Write,Edit,Glob,Grep", disallowed: "Bash,Task,NotebookEdit" }
         : { allowed: "Read,WebFetch,WebSearch,Glob,Grep", disallowed: "Bash,Write,Edit,NotebookEdit,Task" };
-  const args = isClaude
-    ? ["-p", prompt, "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-       "--permission-mode", "acceptEdits",
-       "--allowedTools", tools.allowed,
-       "--disallowedTools", tools.disallowed]
-    : spec.args(prompt);
+  // Streaming and permissions are separate concerns. Any CLI cli-stream.mjs can
+  // parse gets its structured-output args from the spec; the tool-scope flags
+  // below stay Claude-only because they are Claude's permission vocabulary —
+  // grok and codex gate tool use their own way, and passing these to them would
+  // just be an unknown-flag error.
+  const args = spec.streamArgs ? spec.streamArgs(prompt) : spec.args(prompt);
+  if (isClaude) {
+    args.push(
+      "--permission-mode", "acceptEdits",
+      "--allowedTools", tools.allowed,
+      "--disallowedTools", tools.disallowed,
+    );
+  }
 
   // For write-needing kinds, snapshot reports/ so we can verify the worker
   // actually persisted (non-Claude CLIs lack Write auth and silently no-op).
@@ -201,7 +217,19 @@ export async function POST(req: Request) {
   // reconnect.
   const jobRunId = jobId && /^[A-Za-z0-9._-]{1,128}$/.test(jobId) ? jobId : `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  const child = spawn(binPath, args, { cwd: careerOpsRoot(), env: process.env, detached: false });
+  // stdin is 'ignore', not the default pipe. The prompt goes in via argv, so the
+  // child never needs stdin — but with an open pipe nobody ever writes to or
+  // ends, a CLI that checks stdin blocks forever waiting for EOF. Codex prints
+  // "Reading additional input from stdin..." and hangs; it has never worked in
+  // the web UI for this reason. Claude masked it by not reading stdin at all.
+  // Nothing can answer a prompt in a headless run anyway, so refusing stdin is
+  // also the honest configuration.
+  const child = spawn(binPath, args, {
+    cwd: careerOpsRoot(),
+    env: process.env,
+    detached: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   const enc = new TextEncoder();
 
   // The run is now owned by the server, so two states that used to share one
@@ -306,7 +334,9 @@ export async function POST(req: Request) {
         // honesty gates in child.on("close"), so skipping the parse would make a
         // completed run look like "the CLI produced no output".
         if (closed) return;
-        if (!isClaude) {
+        // No parser → the CLI has no structured mode; show its stdout verbatim.
+        // Usage stays unknown for those, which is honest: there is nothing to read.
+        if (!parseEvent) {
           emittedText = true;
           send({ type: "text", text: d.toString() });
           return;
@@ -317,33 +347,37 @@ export async function POST(req: Request) {
           const line = buf.slice(0, nl).trim();
           buf = buf.slice(nl + 1);
           if (!line) continue;
+          let parsed: unknown;
           try {
-            const ev = JSON.parse(line);
-            if (ev.type === "stream_event") {
-              const e = ev.event;
-              if (e?.type === "content_block_start" && e.content_block?.type === "tool_use") {
-                send({ type: "tool", name: e.content_block.name });
-              } else if (e?.type === "content_block_delta" && e.delta?.text) {
-                emittedText = true;
-                send({ type: "text", text: e.delta.text });
-              }
-            } else if (ev.type === "system" && ev.subtype === "init") {
-              send({ type: "status", label: "Agent ready" });
-            } else if (ev.type === "result") {
-              // Capture the per-run cost; the authoritative "done" is sent on close
-              // (so the honesty gate decides done-vs-error first). Tokens = the same
-              // formula /api/usage uses: input + output + cache-creation.
-              const u = ev.usage || {};
-              lastTokens = (u.input_tokens || 0) + (u.output_tokens || 0) + (u.cache_creation_input_tokens || 0);
-              if (typeof ev.total_cost_usd === "number") lastCostUsd = ev.total_cost_usd;
-            }
+            parsed = JSON.parse(line);
           } catch {
-            /* partial line */
+            continue; // partial or non-JSON line
+          }
+          for (const ev of parseEvent(parsed) as StreamEvent[]) {
+            if (ev.type === "text") {
+              emittedText = true;
+              send({ type: "text", text: ev.text });
+            } else if (ev.type === "tool") {
+              send({ type: "tool", name: ev.name });
+            } else if (ev.type === "status") {
+              send({ type: "status", label: ev.label });
+            } else if (ev.type === "usage") {
+              // Last-wins: every CLI's final total arrives last, and keeping the
+              // intermediate ones means a run killed mid-flight still records
+              // something. The authoritative "done" is still sent on close, so
+              // the honesty gate decides done-vs-error first.
+              lastTokens = ev.tokens;
+              if (typeof ev.costUsd === "number") lastCostUsd = ev.costUsd;
+            }
           }
         }
       });
       child.stderr.on("data", (d: Buffer) => {
         const s = d.toString();
+        // Some CLIs log benign diagnostics to stderr that the broad rule below
+        // would read as a failed run — codex emits a models-cache warning on
+        // every single invocation. Skip those before classifying.
+        if (spec.benignStderr?.test(s)) return;
         // Widened: auth/login/quota failures are the most common real error and
         // the old narrow regex missed them (silent false "success").
         if (/error|denied|fatal|not found|unauthorized|forbidden|auth|login|credential|api[ -]?key|quota|rate limit|not authenticated/i.test(s)) {
