@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Check, Loader2 } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { PersonaBanner } from "@/components/cv/persona-banner";
 
 export function CvEditor() {
   const [content, setContent] = useState("");
@@ -13,6 +14,10 @@ export function CvEditor() {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // Bumped on every successful save so the persona check re-runs immediately:
+  // saving a new CV is exactly what makes the search stale, so the warning has
+  // to appear on the edit that caused it, not on the next visit.
+  const [savedCount, setSavedCount] = useState(0);
 
   useEffect(() => {
     fetch("/api/cv")
@@ -36,6 +41,7 @@ export function CvEditor() {
         setDirty(false);
         setExists(true);
         setSaved(true);
+        setSavedCount((n) => n + 1);
         setTimeout(() => setSaved(false), 2000);
       }
     } finally {
@@ -69,10 +75,14 @@ export function CvEditor() {
         </button>
       </div>
 
+      <div className="mt-6">
+        <PersonaBanner refreshKey={savedCount} />
+      </div>
+
       {!loaded ? (
-        <div className="mt-6 text-sm text-muted">Loading…</div>
+        <div className="text-sm text-muted">Loading…</div>
       ) : (
-        <div className="mt-6 grid gap-4 lg:grid-cols-2">
+        <div className="grid gap-4 lg:grid-cols-2">
           <textarea
             value={content}
             onChange={(e) => {
