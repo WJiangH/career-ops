@@ -4,11 +4,19 @@
 
 The scanner only surfaces what `portals.yml` `title_filter.positive` matches —
 and that list is written from the titles the user already knows to search for.
-The same job ships under many names (Solutions Architect / Forward Deployed
-Engineer / Customer Engineer), so the search is silently narrower than the CV
-justifies. This mode reads the CV and proposes adjacent titles the user isn't
-searching for yet — then, only after explicit confirmation, writes the accepted
-keywords into `title_filter.positive` so the very next `scan` casts the wider net.
+The same job ships under many names, so the search is silently narrower than the
+CV justifies: Solutions Architect / Forward Deployed Engineer / Customer Engineer
+are frequently one role — and so are Design Verification Engineer / RTL
+Verification Engineer / Hardware Verification Engineer. This mode reads the CV
+and proposes adjacent titles the user isn't searching for yet — then, only after
+explicit confirmation, writes the accepted keywords into `title_filter.positive`
+so the very next `scan` casts the wider net.
+
+**Every job title named in this file illustrates a mechanic** — how to shorten a
+keyword, why a generic one floods the scan — **and is never a menu of roles to
+suggest.** The space of plausible suggestions comes from `cv.md` and
+`modes/_profile.md`, nothing else. A suggestion that resembles an example here
+but has no evidence in the CV is a wrong answer, however plausible it reads.
 
 `patterns` Step 1b makes the same kind of retargeting recommendation
 ("consider adding archetype X and reweighting `portals.yml`
@@ -80,12 +88,15 @@ list — this system optimizes for quality, not quantity.
 When the user accepts one or more suggestions:
 
 1. Derive **keywords, not raw titles**. The filter matches substrings, so the
-   keyword should be the shortest phrase that still identifies the role family
-   ("Forward Deployed" covers Forward Deployed Engineer/Architect/Lead).
+   keyword should be the shortest phrase that still identifies the role family:
+   "Forward Deployed" covers Forward Deployed Engineer/Architect/Lead, and
+   "Design Verification" covers Design Verification Engineer/Lead/Manager.
 2. Attach a **breadth warning** to any substring-dangerous keyword: because
-   matching is substring-based, a short or generic keyword floods the scan.
-   Propose "Solutions Architect", never bare "Architect" — bare "Architect"
-   would also match Data Architect, Enterprise Architect, Security Architect.
+   matching is substring-based, a short or generic keyword floods the scan. The
+   test is whether the head noun stands alone in unrelated families — propose
+   "Solutions Architect", never bare "Architect", which also matches Data,
+   Enterprise and Security Architect; propose "Physical Design", never bare
+   "Design", which also matches Product and Graphic Design.
    If the user insists on a broad keyword, warn once and comply.
 3. Skip keywords that duplicate existing coverage (same dedup rule as above);
    preserve the casing style already used in the user's `portals.yml`.
