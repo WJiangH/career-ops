@@ -10,7 +10,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseClaude, parseGrok, parseCodex, parserFor } from "../../src/lib/cli-stream.mjs";
+import { parseClaude, parseGrok, parseCodex, parserFor, describeToolInput } from "../../src/lib/cli-stream.mjs";
 
 /** All events of one type, for terser assertions. */
 const only = (events, type) => events.filter((e) => e.type === type);
@@ -22,9 +22,32 @@ test("claude: text deltas become text", () => {
   assert.deepEqual(parseClaude(ev), [{ type: "text", text: "Hello" }]);
 });
 
-test("claude: tool_use blocks become tool events", () => {
-  const ev = { type: "stream_event", event: { type: "content_block_start", content_block: { type: "tool_use", name: "Read" } } };
-  assert.deepEqual(parseClaude(ev), [{ type: "tool", name: "Read" }]);
+test("claude: tool calls come from the assistant event, with their argument", () => {
+  // Verbatim shape from a live run. content_block_start is NOT used: there the
+  // input is still {} and the arguments stream in afterwards as
+  // input_json_delta, so a parser reading it can never name the file.
+  const ev = {
+    type: "assistant",
+    message: { id: "msg_1", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/Users/me/Projects/career-ops/modes/oferta.md" } }] },
+  };
+  assert.deepEqual(parseClaude(ev), [{ type: "tool", name: "Read", detail: "modes/oferta.md" }]);
+});
+
+test("claude: content_block_start no longer emits a tool", () => {
+  // Otherwise every tool would be reported twice — once bare, once with detail.
+  const ev = { type: "stream_event", event: { type: "content_block_start", content_block: { type: "tool_use", name: "Read", input: {} } } };
+  assert.deepEqual(parseClaude(ev), []);
+});
+
+test("claude: the assistant event does not re-emit text", () => {
+  // Text already arrives as deltas; taking both would duplicate every answer.
+  const ev = { type: "assistant", message: { content: [{ type: "text", text: "career-ops" }] } };
+  assert.deepEqual(parseClaude(ev), []);
+});
+
+test("claude: thinking blocks are not tools", () => {
+  const ev = { type: "assistant", message: { content: [{ type: "thinking", thinking: "", signature: "x" }] } };
+  assert.deepEqual(parseClaude(ev), []);
 });
 
 test("claude: usage excludes cache reads", () => {
@@ -61,9 +84,16 @@ test("grok: the tool manifest is dropped", () => {
   assert.deepEqual(parseGrok({ type: "available_commands", tools: ["read_file"], commands: [] }), []);
 });
 
-test("grok: tool_call reports the tool name", () => {
-  const ev = { type: "tool_call", toolCallId: "call-1", title: "read_file", toolName: "read_file", status: "pending" };
-  assert.deepEqual(parseGrok(ev), [{ type: "tool", name: "read_file" }]);
+test("grok: tool_call reports the tool name and its target", () => {
+  const ev = { type: "tool_call", toolCallId: "call-1", title: "read_file", toolName: "read_file", status: "pending", rawInput: { target_file: "/Users/me/Projects/career-ops/package.json", limit: 30 } };
+  assert.deepEqual(parseGrok(ev), [{ type: "tool", name: "read_file", detail: "career-ops/package.json" }]);
+});
+
+test("grok: the web-search label loses its dangling colon", () => {
+  // grok's own toolName is literally "Web search:" — fine in its TUI, dangling
+  // in a line that reads "Using Web search:". rawInput carries no query.
+  const ev = { type: "tool_call", title: "Web search:", toolName: "Web search:", kind: "search", rawInput: { variant: "WebSearch", backend: true } };
+  assert.deepEqual(parseGrok(ev), [{ type: "tool", name: "Web search" }]);
 });
 
 test("grok: end carries the turn total and a real cost", () => {
@@ -92,9 +122,11 @@ test("codex: the answer arrives whole, in a completed agent_message", () => {
   assert.deepEqual(parseCodex(ev), [{ type: "text", text: "career-ops" }]);
 });
 
-test("codex: non-message items are tool activity", () => {
-  const ev = { type: "item.started", item: { id: "item_0", type: "command_execution", command: "/bin/bash -lc 'node doctor.mjs'" } };
-  assert.deepEqual(parseCodex(ev), [{ type: "tool", name: "command_execution" }]);
+test("codex: non-message items are tool activity, with the command unwrapped", () => {
+  // Codex routes everything through a login shell; the wrapper repeats on every
+  // line and the command inside is the actual information.
+  const ev = { type: "item.started", item: { id: "item_0", type: "command_execution", command: "/bin/bash -lc 'node doctor.mjs --json'" } };
+  assert.deepEqual(parseCodex(ev), [{ type: "tool", name: "command_execution", detail: "node doctor.mjs --json" }]);
 });
 
 test("codex: a completed command is not re-reported as a tool", () => {
@@ -138,6 +170,83 @@ for (const [name, parse] of [["claude", parseClaude], ["grok", parseGrok], ["cod
     assert.equal(parse(ev)[0].tokens, 0);
   });
 }
+
+// ── failures that arrive on stdout ───────────────────────────────────────────
+//
+// The route watches stderr for failures. Both of these come down stdout instead,
+// so before this they were dropped and the run failed later with the generic
+// "produced no output" — hiding the actual reason.
+
+test("claude: an auth failure in a result event surfaces as an error", () => {
+  // Verbatim from a run with no token: is_error rides on a normal result line.
+  const ev = { type: "result", subtype: "success", is_error: true, result: "Not logged in · Please run /login", usage: {} };
+  const out = parseClaude(ev);
+  assert.deepEqual(only(out, "error"), [{ type: "error", msg: "Not logged in · Please run /login" }]);
+  assert.equal(only(out, "usage").length, 1, "usage is still reported alongside");
+});
+
+test("claude: a successful result reports no error", () => {
+  const ev = { type: "result", is_error: false, result: "career-ops", usage: { input_tokens: 5, output_tokens: 1 } };
+  assert.deepEqual(only(parseClaude(ev), "error"), []);
+});
+
+test("codex: an API rejection is unwrapped to its sentence", () => {
+  // Codex nests the upstream error as a JSON string inside its own event; the
+  // raw blob would put three lines of escaped JSON where one sentence belongs.
+  const inner = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "[reasoning.effort] Invalid value: 'bogus'." } });
+  assert.deepEqual(parseCodex({ type: "error", message: inner }), [{ type: "error", msg: "[reasoning.effort] Invalid value: 'bogus'." }]);
+});
+
+test("codex: turn.failed is an error too", () => {
+  assert.deepEqual(parseCodex({ type: "turn.failed", error: { message: "quota exceeded" } }), [{ type: "error", msg: "quota exceeded" }]);
+});
+
+test("codex: a non-JSON error message is passed through as-is", () => {
+  assert.deepEqual(parseCodex({ type: "error", message: "connection reset" }), [{ type: "error", msg: "connection reset" }]);
+});
+
+test("codex: an error with no message still says something", () => {
+  assert.equal(parseCodex({ type: "error" })[0].msg, "the CLI reported an error");
+});
+
+// ── tool detail ──────────────────────────────────────────────────────────────
+
+test("detail: an absolute path keeps only its meaningful tail", () => {
+  assert.equal(describeToolInput({ file_path: "/Users/me/Projects/career-ops/modes/oferta.md" }), "modes/oferta.md");
+  assert.equal(describeToolInput({ path: "/etc/hosts" }), "/etc/hosts", "already short enough to keep whole");
+  assert.equal(describeToolInput({ file_path: "portals.yml" }), "portals.yml", "a relative path is left alone");
+});
+
+test("detail: shell wrappers are unwrapped, single or double quoted", () => {
+  assert.equal(describeToolInput({ command: `/bin/bash -lc 'node merge-tracker.mjs'` }), "node merge-tracker.mjs");
+  assert.equal(describeToolInput({ command: `bash -c "ls -la"` }), "ls -la");
+  assert.equal(describeToolInput({ command: "node scan.mjs --dry-run" }), "node scan.mjs --dry-run", "an unwrapped command is untouched");
+});
+
+test("detail: keys are tried in priority order", () => {
+  assert.equal(describeToolInput({ query: "q", file_path: "a/b.md" }), "a/b.md", "the path is more identifying than the query");
+});
+
+test("detail: long values are truncated with an ellipsis", () => {
+  const out = describeToolInput({ command: "x".repeat(200) });
+  assert.equal(out.length, 72);
+  assert.ok(out.endsWith("…"));
+});
+
+test("detail: newlines never break the single-line layout", () => {
+  assert.equal(describeToolInput({ command: "line one\n  line two" }), "line one line two");
+});
+
+test("detail: an unrecognised shape yields nothing rather than a random field", () => {
+  assert.equal(describeToolInput({ mysteryOption: "value", backend: true }), "");
+  assert.equal(describeToolInput({ file_path: "   " }), "", "blank is not a detail");
+  for (const junk of [null, undefined, "str", 42, []]) assert.equal(describeToolInput(junk), "");
+});
+
+test("detail: a tool with no readable argument omits the key entirely", () => {
+  const [ev] = parseCodex({ type: "item.started", item: { type: "web_search" } });
+  assert.deepEqual(ev, { type: "tool", name: "web_search" }, "no empty-string detail to render");
+});
 
 // ── registry ─────────────────────────────────────────────────────────────────
 

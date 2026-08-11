@@ -20,6 +20,10 @@ type Cli = {
   url: string;
   installed: boolean;
   path: string | null;
+  /** Whether this CLI exposes a model flag at all. */
+  supportsModel?: boolean;
+  /** Effort levels this CLI accepts; empty when it has no such flag. */
+  efforts?: string[];
 };
 
 type Mode = "cli" | "key" | "manual";
@@ -37,6 +41,11 @@ export function ConfigForm() {
   const [mode, setMode] = useState<Mode>("cli");
   const [clis, setClis] = useState<Cli[] | null>(null);
   const [cliId, setCliId] = useState<string>("");
+  // Per-CLI, because the values are not portable: "high" is valid everywhere but
+  // "xhigh" only on claude/codex, and a model name for one CLI is meaningless to
+  // another. Keying by CLI means switching back restores what you had.
+  const [models, setModels] = useState<Record<string, string>>({});
+  const [efforts, setEfforts] = useState<Record<string, string>>({});
   const [provider, setProvider] = useState("anthropic");
   const [apiKey, setApiKey] = useState("");
   const [logos, setLogos] = useState(true);
@@ -52,6 +61,8 @@ export function ConfigForm() {
         // those dead panels; only the Installed-CLI path is functional.
         if (v.mode === "cli") setMode("cli");
         if (v.cliId) setCliId(v.cliId);
+        if (v.models && typeof v.models === "object") setModels(v.models);
+        if (v.efforts && typeof v.efforts === "object") setEfforts(v.efforts);
         if (v.provider) setProvider(v.provider);
         if (typeof v.logos === "boolean") setLogos(v.logos);
       }
@@ -77,7 +88,7 @@ export function ConfigForm() {
     // The API key is deliberately NOT persisted: nothing reads it yet (the
     // key/manual panel is unwired) and a secret must never sit in clear-text
     // localStorage. Keys belong in the user's own CLI/provider config.
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ mode, cliId, provider, logos }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ mode, cliId, provider, logos, models, efforts }));
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   }
@@ -147,7 +158,7 @@ export function ConfigForm() {
                     <div
                       key={c.id}
                       className={cn(
-                        "flex items-center gap-3 rounded-xl border px-4 py-3 text-sm transition-colors",
+                        "rounded-xl border text-sm transition-colors",
                         selected
                           ? "border-brand/50 bg-brand-soft"
                           : c.installed
@@ -155,6 +166,7 @@ export function ConfigForm() {
                             : "border-border/60 bg-surface/20",
                       )}
                     >
+                      <div className="flex items-center gap-3 px-4 py-3">
                       {c.installed ? (
                         <Check className="size-4 shrink-0 text-emerald-400" />
                       ) : (
@@ -192,6 +204,50 @@ export function ConfigForm() {
                         >
                           Install <ExternalLink className="size-3" />
                         </a>
+                      )}
+                      </div>
+                      {/* Only under the CLI actually in use, and only the knobs
+                          that CLI has: gemini exposes no effort flag, opencode
+                          neither. A visible control that does nothing is worse
+                          than no control. */}
+                      {selected && (c.supportsModel || (c.efforts?.length ?? 0) > 0) && (
+                        <div className="flex flex-wrap items-center gap-3 border-t border-border/60 px-4 py-3">
+                          {c.supportsModel && (
+                            <label className="flex min-w-0 flex-1 items-center gap-2 text-xs">
+                              <span className="shrink-0 text-muted">Model</span>
+                              {/* Free text, not a dropdown: only some CLIs can
+                                  enumerate their models, and any list hardcoded
+                                  here goes stale the week a new one ships.
+                                  Empty means the CLI's own default. */}
+                              <input
+                                type="text"
+                                value={models[c.id] ?? ""}
+                                onChange={(e) => setModels((m) => ({ ...m, [c.id]: e.target.value }))}
+                                placeholder="default"
+                                spellCheck={false}
+                                className="min-w-0 flex-1 rounded-lg border border-border bg-surface px-2.5 py-1.5 font-mono text-xs max-sm:min-h-[44px]"
+                              />
+                            </label>
+                          )}
+                          {(c.efforts?.length ?? 0) > 0 && (
+                            <label className="flex shrink-0 items-center gap-2 text-xs">
+                              <span className="text-muted">Effort</span>
+                              {/* A dropdown here, unlike model: the accepted set
+                                  is fixed per CLI, and two of the three abort
+                                  the run outright on an unknown level. */}
+                              <select
+                                value={efforts[c.id] ?? ""}
+                                onChange={(e) => setEfforts((m) => ({ ...m, [c.id]: e.target.value }))}
+                                className="rounded-lg border border-border bg-surface px-2.5 py-1.5 text-xs max-sm:min-h-[44px]"
+                              >
+                                <option value="">default</option>
+                                {(c.efforts ?? []).map((e) => (
+                                  <option key={e} value={e}>{e}</option>
+                                ))}
+                              </select>
+                            </label>
+                          )}
+                        </div>
                       )}
                     </div>
                   );

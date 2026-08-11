@@ -64,8 +64,15 @@ export default function JobPage({ params }: { params: Promise<{ id: string }> })
             ) : (
               <CircleDot className="mt-0.5 size-3.5 shrink-0 text-faint" />
             )}
-            <span className={s.kind === "tool" ? "font-medium" : "text-muted"}>
+            <span className={s.kind === "tool" ? "min-w-0 font-medium" : "text-muted"}>
               {s.kind === "tool" ? `Using ${s.label}` : s.label}
+              {/* The argument is what distinguishes twenty read_file lines from
+                  each other. Muted and lighter: the tool is the event, the
+                  argument is the subject. break-all so a long path wraps
+                  instead of widening the pane. */}
+              {s.detail && (
+                <span className="ml-2 break-all font-normal text-muted">{s.detail}</span>
+              )}
             </span>
           </li>
         ))}

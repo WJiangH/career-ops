@@ -47,6 +47,62 @@ function n(v) {
   return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
 }
 
+// ── Tool detail ──────────────────────────────────────────────────────────────
+//
+// A run log of twenty identical "Using read_file" lines says nothing about what
+// the agent actually did. Every CLI already ships the argument; it was simply
+// being dropped. `detail` is that argument, shortened for one line of UI.
+
+/** Argument keys worth showing, most specific first. Unknown tools fall through
+ *  to no detail rather than printing a random field. */
+const DETAIL_KEYS = [
+  'file_path', 'target_file', 'notebook_path', 'path',
+  'command', 'pattern', 'query', 'url', 'prompt',
+];
+
+/** Absolute paths are mostly the user's home prefix. The tail carries the
+ *  meaning: /Users/me/Projects/career-ops/modes/oferta.md → modes/oferta.md */
+function shortenPath(v) {
+  if (!v.startsWith('/') || v.includes(' ')) return v;
+  const parts = v.split('/').filter(Boolean);
+  return parts.length > 2 ? parts.slice(-2).join('/') : v;
+}
+
+/** Codex routes every command through a login shell; the wrapper is noise
+ *  repeated on every line, and the command inside is the information. */
+function unwrapShell(v) {
+  const m = v.match(/^(?:\/bin\/)?(?:ba|z|)sh\s+-l?c\s+(['"])([\s\S]*)\1\s*$/);
+  return m ? m[2] : v;
+}
+
+/**
+ * One-line description of a tool call's argument.
+ *
+ * @param {unknown} input - The tool's argument object.
+ * @param {number} [max] - Truncation width.
+ * @returns {string} Possibly empty — an unrecognised shape yields no detail.
+ */
+export function describeToolInput(input, max = 72) {
+  if (!input || typeof input !== 'object') return '';
+  for (const key of DETAIL_KEYS) {
+    const raw = /** @type {Record<string, unknown>} */ (input)[key];
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    let v = unwrapShell(raw.trim()).replace(/\s+/g, ' ');
+    v = shortenPath(v);
+    return v.length > max ? `${v.slice(0, max - 1)}…` : v;
+  }
+  return '';
+}
+
+/** A tool event, with the argument when one could be read. */
+function toolEvent(name, input) {
+  // Grok labels its web search tool "Web search:" — its own display string,
+  // trailing colon and all. Harmless in grok's TUI, dangling in ours.
+  const clean = String(name ?? 'tool').replace(/[:\s]+$/, '') || 'tool';
+  const detail = describeToolInput(input);
+  return detail ? { type: 'tool', name: clean, detail } : { type: 'tool', name: clean };
+}
+
 /** Claude / Grok convention: input excludes cache reads. */
 function fullRateAnthropicStyle(u) {
   return n(u.input_tokens) + n(u.output_tokens) + n(u.cache_creation_input_tokens);
@@ -54,15 +110,33 @@ function fullRateAnthropicStyle(u) {
 
 /**
  * Claude Code — `--output-format stream-json --verbose --include-partial-messages`
+ *
+ * Tool calls are read from the non-streaming `assistant` event, NOT from
+ * `content_block_start`. At block start Claude's tool `input` is still `{}` —
+ * the arguments arrive afterwards as `input_json_delta` fragments, so a parser
+ * reading only the start event can never say which file was read. The
+ * `assistant` event carries the completed block with its full input, and
+ * arrives before `content_block_stop`, so the log line is later by the time it
+ * takes to stream one small JSON object.
+ *
+ * Verified not cumulative: two Read calls produce two `assistant` events with
+ * one tool_use block each, so this cannot double-report and the parser stays
+ * stateless. Text is deliberately NOT taken from here — it already streams as
+ * deltas, and reading both would duplicate every answer.
  */
 export function parseClaude(ev) {
   if (!ev || typeof ev !== 'object') return [];
 
+  if (ev.type === 'assistant') {
+    const blocks = ev.message?.content;
+    if (!Array.isArray(blocks)) return [];
+    return blocks
+      .filter((b) => b?.type === 'tool_use')
+      .map((b) => toolEvent(b.name, b.input));
+  }
+
   if (ev.type === 'stream_event') {
     const e = ev.event;
-    if (e?.type === 'content_block_start' && e.content_block?.type === 'tool_use') {
-      return [{ type: 'tool', name: String(e.content_block.name ?? 'tool') }];
-    }
     if (e?.type === 'content_block_delta' && e.delta?.text) {
       return [{ type: 'text', text: String(e.delta.text) }];
     }
@@ -72,12 +146,17 @@ export function parseClaude(ev) {
     return [{ type: 'status', label: 'Agent ready' }];
   }
   if (ev.type === 'result') {
-    const u = ev.usage || {};
-    return [{
+    const out = [{
       type: 'usage',
-      tokens: fullRateAnthropicStyle(u),
+      tokens: fullRateAnthropicStyle(ev.usage || {}),
       costUsd: typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : null,
     }];
+    // Auth failure arrives here, on STDOUT, as a successful-looking line:
+    // {"type":"result","is_error":true,"result":"Not logged in · Please run /login"}.
+    // The route's error detection watches stderr, so this was invisible and the
+    // run only failed later, generically, for having produced no text.
+    if (ev.is_error) out.push({ type: 'error', msg: String(ev.result ?? 'the CLI reported an error') });
+    return out;
   }
   return [];
 }
@@ -103,7 +182,7 @@ export function parseGrok(ev) {
     case 'text':
       return ev.data ? [{ type: 'text', text: String(ev.data) }] : [];
     case 'tool_call':
-      return [{ type: 'tool', name: String(ev.toolName ?? ev.title ?? 'tool') }];
+      return [toolEvent(ev.toolName ?? ev.title, ev.rawInput)];
     case 'usage':
     case 'end': {
       const u = ev.usage || {};
@@ -120,6 +199,26 @@ export function parseGrok(ev) {
 }
 
 /**
+ * Codex nests the upstream API error as a JSON string inside its own error
+ * event. Surfacing the raw blob would put three lines of escaped JSON in the
+ * log where one sentence belongs.
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function extractApiMessage(raw) {
+  const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
+  try {
+    const inner = JSON.parse(text);
+    const msg = inner?.error?.message ?? inner?.message;
+    if (typeof msg === 'string' && msg.trim()) return msg.trim().slice(0, 300);
+  } catch {
+    /* not nested JSON — use it as-is */
+  }
+  return (text || 'the CLI reported an error').trim().slice(0, 300);
+}
+
+/**
  * Codex — `codex exec --json`
  *
  * Text arrives whole in a completed `agent_message` item rather than as deltas,
@@ -132,10 +231,18 @@ export function parseCodex(ev) {
   if (ev.type === 'thread.started') return [{ type: 'status', label: 'Agent ready' }];
 
   if (ev.type === 'item.started' && ev.item?.type && ev.item.type !== 'agent_message') {
-    return [{ type: 'tool', name: String(ev.item.type) }];
+    // The argument sits directly on the item, not in a nested input object.
+    return [toolEvent(ev.item.type, ev.item)];
   }
   if (ev.type === 'item.completed' && ev.item?.type === 'agent_message' && ev.item.text) {
     return [{ type: 'text', text: String(ev.item.text) }];
+  }
+  // API failures come down stdout, not stderr — an invalid effort level, a
+  // quota rejection, a 400. Without this the run just ends with no text and the
+  // honesty gate reports the generic "produced no output" instead of the reason.
+  if (ev.type === 'error' || ev.type === 'turn.failed') {
+    const raw = ev.message ?? ev.error?.message ?? '';
+    return [{ type: 'error', msg: extractApiMessage(raw) }];
   }
   if (ev.type === 'turn.completed') {
     const u = ev.usage || {};

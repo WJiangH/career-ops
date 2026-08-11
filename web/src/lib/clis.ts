@@ -26,21 +26,48 @@ export type CliSpec = {
    * run, which that rule reads as a failed run.
    */
   benignStderr?: RegExp;
+  /** Args selecting a model. Absent when the CLI exposes no such flag. */
+  modelArgs?: (model: string) => string[];
+  /** Args selecting reasoning effort. */
+  effortArgs?: (effort: string) => string[];
+  /**
+   * Effort levels this CLI accepts. Each list was read off the CLI itself
+   * (`--help`, or the error text from a deliberately invalid value) rather than
+   * assumed — they genuinely differ, and two of the three reject an unknown
+   * level outright instead of falling back to a default.
+   */
+  efforts?: string[];
 };
 
 export const KNOWN: CliSpec[] = [
   { id: "claude", name: "Claude Code", bin: "claude", run: "claude -p", url: "https://claude.ai/code", args: (p) => ["-p", p],
-    streamArgs: (p) => ["-p", p, "--output-format", "stream-json", "--verbose", "--include-partial-messages"] },
+    streamArgs: (p) => ["-p", p, "--output-format", "stream-json", "--verbose", "--include-partial-messages"],
+    modelArgs: (m) => ["--model", m],
+    // An unknown level here is only a warning — claude carries on with its
+    // default. The other two abort the run.
+    effortArgs: (e) => ["--effort", e],
+    efforts: ["low", "medium", "high", "xhigh", "max"] },
   { id: "codex", name: "Codex", bin: "codex", run: "codex exec", url: "https://github.com/openai/codex", args: (p) => ["exec", p],
     streamArgs: (p) => ["exec", "--json", p],
-    benignStderr: /models cache|base_instructions/i },
-  { id: "gemini", name: "Gemini CLI", bin: "gemini", run: "gemini -p", url: "https://github.com/google-gemini/gemini-cli", args: (p) => ["-p", p] },
+    benignStderr: /models cache|base_instructions/i,
+    modelArgs: (m) => ["--model", m],
+    // No dedicated flag: effort rides on the generic config override. An
+    // unsupported value fails the turn with a 400 from the API, not locally.
+    effortArgs: (e) => ["-c", `model_reasoning_effort=${e}`],
+    efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"] },
+  // No effort flag: gemini exposes only a model selector.
+  { id: "gemini", name: "Gemini CLI", bin: "gemini", run: "gemini -p", url: "https://github.com/google-gemini/gemini-cli", args: (p) => ["-p", p],
+    modelArgs: (m) => ["--model", m] },
   { id: "opencode", name: "OpenCode", bin: "opencode", run: "opencode run", url: "https://opencode.ai", args: (p) => ["run", p] },
   { id: "copilot", name: "GitHub Copilot CLI", bin: "copilot", run: "copilot -p", url: "https://docs.github.com/en/copilot/github-copilot-in-the-cli", args: (p) => ["-p", p] },
   { id: "qwen", name: "Qwen CLI", bin: "qwen", run: "qwen -p", url: "https://qwen.ai/qwencode", args: (p) => ["-p", p] },
   { id: "antigravity", name: "Antigravity CLI", bin: "agy", run: "agy -p", url: "https://antigravity.google", args: (p) => ["-p", p] },
   { id: "grok", name: "Grok Build CLI", bin: "grok", run: "grok -p", url: "https://docs.x.ai/build/overview", args: (p) => ["-p", p],
-    streamArgs: (p) => ["-p", p, "--output-format", "streaming-json"] },
+    streamArgs: (p) => ["-p", p, "--output-format", "streaming-json"],
+    modelArgs: (m) => ["--model", m],
+    // Rejects anything outside this set with a non-zero exit before any work.
+    effortArgs: (e) => ["--reasoning-effort", e],
+    efforts: ["low", "medium", "high"] },
 ];
 
 function searchDirs(): string[] {
@@ -105,7 +132,14 @@ export function detectClis() {
   const dirs = searchDirs();
   return KNOWN.map((c) => {
     const found = findBin(c.bin, dirs);
-    return { id: c.id, name: c.name, run: c.run, url: c.url, installed: !!found, path: found };
+    return {
+      id: c.id, name: c.name, run: c.run, url: c.url, installed: !!found, path: found,
+      // What the Config picker may offer for this CLI. `supportsModel` rather
+      // than a model list: only some CLIs can enumerate their models, and any
+      // list we hardcoded would be stale the week a new one ships.
+      supportsModel: !!c.modelArgs,
+      efforts: c.efforts ?? [],
+    };
   });
 }
 

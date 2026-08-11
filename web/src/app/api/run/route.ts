@@ -13,9 +13,10 @@ import { newReportSince, readMachineSummary, snapshotReports } from "@/lib/machi
 /** The normalized shape cli-stream.mjs parsers emit, whatever the CLI's dialect. */
 type StreamEvent =
   | { type: "text"; text: string }
-  | { type: "tool"; name: string }
+  | { type: "tool"; name: string; detail?: string }
   | { type: "status"; label: string }
-  | { type: "usage"; tokens: number; costUsd: number | null };
+  | { type: "usage"; tokens: number; costUsd: number | null }
+  | { type: "error"; msg: string };
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -83,13 +84,13 @@ Posting URL: ${input}`;
 }
 
 export async function POST(req: Request) {
-  let body: { kind?: string; input?: string; cliId?: string; jobId?: string };
+  let body: { kind?: string; input?: string; cliId?: string; jobId?: string; model?: string; effort?: string };
   try {
     body = await req.json();
   } catch {
     return new Response(JSON.stringify({ error: "bad json" }), { status: 400 });
   }
-  const { kind = "evaluate", input, cliId, jobId } = body;
+  const { kind = "evaluate", input, cliId, jobId, model, effort } = body;
   if (!input || !cliId) {
     return new Response(JSON.stringify({ error: "input and cliId required" }), { status: 400 });
   }
@@ -184,6 +185,25 @@ export async function POST(req: Request) {
   // grok and codex gate tool use their own way, and passing these to them would
   // just be an unknown-flag error.
   const args = spec.streamArgs ? spec.streamArgs(prompt) : spec.args(prompt);
+
+  // Model and effort are opt-in: absent, each CLI uses its own default. Values
+  // are passed as separate argv entries (never interpolated into a shell), so
+  // an odd string is at worst an unknown-flag error from the CLI, never
+  // injection. Effort is validated against what the CLI actually accepts —
+  // grok exits non-zero on an unknown level and codex fails the turn with a
+  // 400, so silently forwarding a bad value would burn a run to learn nothing.
+  if (model?.trim() && spec.modelArgs) args.push(...spec.modelArgs(model.trim()));
+  if (effort?.trim() && spec.effortArgs) {
+    const want = effort.trim();
+    if (spec.efforts?.length && !spec.efforts.includes(want)) {
+      return new Response(
+        JSON.stringify({ error: `${spec.name} does not accept effort '${want}'. Supported: ${spec.efforts.join(", ")}` }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+    }
+    args.push(...spec.effortArgs(want));
+  }
+
   if (isClaude) {
     args.push(
       "--permission-mode", "acceptEdits",
@@ -358,9 +378,15 @@ export async function POST(req: Request) {
               emittedText = true;
               send({ type: "text", text: ev.text });
             } else if (ev.type === "tool") {
-              send({ type: "tool", name: ev.name });
+              send(ev.detail ? { type: "tool", name: ev.name, detail: ev.detail } : { type: "tool", name: ev.name });
             } else if (ev.type === "status") {
               send({ type: "status", label: ev.label });
+            } else if (ev.type === "error") {
+              // Same treatment as a stderr failure: mark it so the honesty gate
+              // records "error", and tell the user the actual reason instead of
+              // the generic no-output message.
+              sawError = true;
+              send({ type: "error", msg: ev.msg.slice(0, 300) });
             } else if (ev.type === "usage") {
               // Last-wins: every CLI's final total arrives last, and keeping the
               // intermediate ones means a run killed mid-flight still records

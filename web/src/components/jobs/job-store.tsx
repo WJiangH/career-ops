@@ -3,7 +3,9 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { scoreTone } from "@/lib/format";
 
-export type JobStep = { kind: "tool" | "status"; label: string; ts: number };
+// `detail` is the tool's argument (file read, command run, query searched).
+// Optional: a CLI may not ship one, and an unrecognised argument shape yields none.
+export type JobStep = { kind: "tool" | "status"; label: string; detail?: string; ts: number };
 export type JobResult = { score: number | null; summary: string; tone: "good" | "warn" | "bad" | "muted" };
 
 /**
@@ -120,11 +122,11 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
     try {
       const r = await fetch(`/api/jobs/${id}/events?from=0`, { cache: "no-store" });
       if (!r.ok) return;
-      const { events } = (await r.json()) as { events: Array<{ type?: string; name?: string; label?: string; text?: string }> };
+      const { events } = (await r.json()) as { events: Array<{ type?: string; name?: string; detail?: string; label?: string; text?: string }> };
       const steps: JobStep[] = [];
       let text = "";
       for (const ev of events) {
-        if (ev.type === "tool") steps.push({ kind: "tool", label: ev.name!, ts: Date.now() });
+        if (ev.type === "tool") steps.push({ kind: "tool", label: ev.name!, detail: ev.detail, ts: Date.now() });
         else if (ev.type === "status") steps.push({ kind: "status", label: ev.label!, ts: Date.now() });
         else if (ev.type === "text") text = (text + ev.text).slice(-8000);
       }
@@ -190,9 +192,18 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
   const startJob = useCallback(
     (opts: StartOpts): string | null => {
       let cliId: string | null = null;
+      // Model/effort are keyed by CLI in Config: "xhigh" is valid on claude and
+      // codex but not grok, and a model name means nothing to another vendor.
+      let model: string | undefined;
+      let effort: string | undefined;
       try {
         const raw = localStorage.getItem(CONFIG_KEY);
-        cliId = raw ? JSON.parse(raw).cliId || null : null;
+        const cfg = raw ? JSON.parse(raw) : null;
+        cliId = cfg?.cliId || null;
+        if (cliId) {
+          model = cfg?.models?.[cliId] || undefined;
+          effort = cfg?.efforts?.[cliId] || undefined;
+        }
       } catch {
         cliId = null;
       }
@@ -257,11 +268,12 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
         let seen = 0;
         let terminal: "done" | "error" | null = null;
         let terminalMsg = "";
-        const applyEvent = (ev: { type?: string; name?: string; label?: string; text?: string; tokens?: number; costUsd?: number; msg?: string }) => {
+        const applyEvent = (ev: { type?: string; name?: string; detail?: string; label?: string; text?: string; tokens?: number; costUsd?: number; msg?: string }) => {
           seen++;
           if (ev.type === "tool") {
-            steps.push({ kind: "tool", label: ev.name!, ts: Date.now() });
-            patch(id, (j) => ({ ...j, steps: [...j.steps, { kind: "tool", label: ev.name!, ts: Date.now() }] }));
+            const step: JobStep = { kind: "tool", label: ev.name!, detail: ev.detail, ts: Date.now() };
+            steps.push(step);
+            patch(id, (j) => ({ ...j, steps: [...j.steps, step] }));
           } else if (ev.type === "status") {
             steps.push({ kind: "status", label: ev.label!, ts: Date.now() });
             patch(id, (j) => ({ ...j, steps: [...j.steps, { kind: "status", label: ev.label!, ts: Date.now() }] }));
@@ -315,7 +327,7 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
             // Hand the server our id so the transcript is addressable the moment
             // the run starts — without it a client that dies early could never
             // find its own job again.
-            body: JSON.stringify({ kind: opts.kind, input: opts.input, cliId, jobId: id }),
+            body: JSON.stringify({ kind: opts.kind, input: opts.input, cliId, jobId: id, model, effort }),
           });
           if (!res.ok || !res.body) {
             const e = await res.json().catch(() => ({}));
