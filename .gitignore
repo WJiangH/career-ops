@@ -63,6 +63,7 @@ writing-samples/*
 
 # Working notes from our own sessions — drafts, not project files.
 /FORK-WORKFLOW.md
+/TODO.md
 
 # User config and customization (never auto-updated)
 config/profile.yml
