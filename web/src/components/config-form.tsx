@@ -20,8 +20,12 @@ type Cli = {
   url: string;
   installed: boolean;
   path: string | null;
-  /** Whether this CLI exposes a model flag at all. */
-  supportsModel?: boolean;
+  /**
+   * Models offered for this CLI, from the scan-cli-models cache. Empty when the
+   * CLI has no model flag, when no scan has run, or when it reported exactly
+   * one — a dropdown of one is not a choice.
+   */
+  models?: string[];
   /** Effort levels this CLI accepts; empty when it has no such flag. */
   efforts?: string[];
 };
@@ -210,23 +214,32 @@ export function ConfigForm() {
                           that CLI has: gemini exposes no effort flag, opencode
                           neither. A visible control that does nothing is worse
                           than no control. */}
-                      {selected && (c.supportsModel || (c.efforts?.length ?? 0) > 0) && (
+                      {selected && ((c.models?.length ?? 0) > 0 || (c.efforts?.length ?? 0) > 0) && (
                         <div className="flex flex-wrap items-center gap-3 border-t border-border/60 px-4 py-3">
-                          {c.supportsModel && (
-                            <label className="flex min-w-0 flex-1 items-center gap-2 text-xs">
+                          {(c.models?.length ?? 0) > 0 && (
+                            <label className="flex min-w-0 items-center gap-2 text-xs">
                               <span className="shrink-0 text-muted">Model</span>
-                              {/* Free text, not a dropdown: only some CLIs can
-                                  enumerate their models, and any list hardcoded
-                                  here goes stale the week a new one ships.
-                                  Empty means the CLI's own default. */}
-                              <input
-                                type="text"
+                              {/* Populated by `npm run scan-cli-models`, not
+                                  hardcoded: the lists move when a vendor ships
+                                  a tier or you switch accounts. Re-run it to
+                                  refresh. Empty selection = the CLI's default. */}
+                              <select
                                 value={models[c.id] ?? ""}
                                 onChange={(e) => setModels((m) => ({ ...m, [c.id]: e.target.value }))}
-                                placeholder="default"
-                                spellCheck={false}
-                                className="min-w-0 flex-1 rounded-lg border border-border bg-surface px-2.5 py-1.5 font-mono text-xs max-sm:min-h-[44px]"
-                              />
+                                className="min-w-0 rounded-lg border border-border bg-surface px-2.5 py-1.5 font-mono text-xs max-sm:min-h-[44px]"
+                              >
+                                <option value="">default</option>
+                                {(c.models ?? []).map((m) => (
+                                  <option key={m} value={m}>{m}</option>
+                                ))}
+                                {/* A saved model a rescan no longer lists still
+                                    renders, marked. Without it the select shows
+                                    blank — which reads as "default" — while the
+                                    stale value is what actually gets sent. */}
+                                {models[c.id] && !(c.models ?? []).includes(models[c.id]) && (
+                                  <option value={models[c.id]}>{models[c.id]} (no longer listed)</option>
+                                )}
+                              </select>
                             </label>
                           )}
                           {(c.efforts?.length ?? 0) > 0 && (

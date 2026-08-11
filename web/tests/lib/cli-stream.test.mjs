@@ -28,7 +28,7 @@ test("claude: tool calls come from the assistant event, with their argument", ()
   // input_json_delta, so a parser reading it can never name the file.
   const ev = {
     type: "assistant",
-    message: { id: "msg_1", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/Users/me/Projects/career-ops/modes/oferta.md" } }] },
+    message: { id: "msg_1", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/home/dev/career-ops/modes/oferta.md" } }] },
   };
   assert.deepEqual(parseClaude(ev), [{ type: "tool", name: "Read", detail: "modes/oferta.md" }]);
 });
@@ -85,7 +85,7 @@ test("grok: the tool manifest is dropped", () => {
 });
 
 test("grok: tool_call reports the tool name and its target", () => {
-  const ev = { type: "tool_call", toolCallId: "call-1", title: "read_file", toolName: "read_file", status: "pending", rawInput: { target_file: "/Users/me/Projects/career-ops/package.json", limit: 30 } };
+  const ev = { type: "tool_call", toolCallId: "call-1", title: "read_file", toolName: "read_file", status: "pending", rawInput: { target_file: "/home/dev/career-ops/package.json", limit: 30 } };
   assert.deepEqual(parseGrok(ev), [{ type: "tool", name: "read_file", detail: "career-ops/package.json" }]);
 });
 
@@ -212,7 +212,7 @@ test("codex: an error with no message still says something", () => {
 // ── tool detail ──────────────────────────────────────────────────────────────
 
 test("detail: an absolute path keeps only its meaningful tail", () => {
-  assert.equal(describeToolInput({ file_path: "/Users/me/Projects/career-ops/modes/oferta.md" }), "modes/oferta.md");
+  assert.equal(describeToolInput({ file_path: "/home/dev/career-ops/modes/oferta.md" }), "modes/oferta.md");
   assert.equal(describeToolInput({ path: "/etc/hosts" }), "/etc/hosts", "already short enough to keep whole");
   assert.equal(describeToolInput({ file_path: "portals.yml" }), "portals.yml", "a relative path is left alone");
 });

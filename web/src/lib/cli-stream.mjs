@@ -61,7 +61,7 @@ const DETAIL_KEYS = [
 ];
 
 /** Absolute paths are mostly the user's home prefix. The tail carries the
- *  meaning: /Users/me/Projects/career-ops/modes/oferta.md → modes/oferta.md */
+ *  meaning: /home/dev/career-ops/modes/oferta.md → modes/oferta.md */
 function shortenPath(v) {
   if (!v.startsWith('/') || v.includes(' ')) return v;
   const parts = v.split('/').filter(Boolean);

@@ -1,6 +1,9 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+// Executable lookup lives in .mjs so plain Node scripts (scan-cli-models) can
+// share it rather than reimplementing PATH + PATHEXT resolution.
+import { findBin, searchDirs } from "./clis-bin.mjs";
+import { CLI_MODELS_CACHE, readModelCache } from "./cli-models-cache.mjs";
 
 // Server-only (node imports). The agnostic runtimes career-ops can delegate to
 // in headless mode (AGENTS.md). Install URLs from career-ops-docs.
@@ -70,74 +73,21 @@ export const KNOWN: CliSpec[] = [
     efforts: ["low", "medium", "high"] },
 ];
 
-function searchDirs(): string[] {
-  const home = os.homedir();
-  const extra = [
-    path.join(home, ".local/bin"),
-    path.join(home, ".npm-global/bin"),
-    path.join(home, ".bun/bin"),
-    path.join(home, ".deno/bin"),
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-  ];
-  if (process.platform === "win32") {
-    // Windows CLIs frequently install under per-user AppData roots and don't
-    // reliably add themselves to PATH (e.g. Antigravity → %LOCALAPPDATA%\agy\bin).
-    const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
-    const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
-    extra.push(
-      path.join(localAppData, "agy", "bin"), // Antigravity CLI
-      path.join(localAppData, "Microsoft", "WindowsApps"), // winget/Store shims
-      path.join(appData, "npm"), // npm global prefix on Windows
-    );
-  }
-  const fromPath = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
-  return [...new Set([...fromPath, ...extra])];
-}
-
-// On Windows, executables carry an extension (claude.exe, claude.cmd, ...).
-// Mirror the shell's PATHEXT resolution so a native-installer claude.exe is
-// found, not just an extensionless npm shim. On POSIX, "" keeps the bare name.
-function binCandidates(bin: string): string[] {
-  if (process.platform !== "win32") return [bin];
-  const pathext = process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD";
-  const exts = pathext
-    .split(";")
-    .map((e) => e.trim())
-    .filter(Boolean)
-    // Only include extensions that `child_process.spawn()` can execute directly.
-    .filter((e) => [".com", ".exe", ".bat", ".cmd"].includes(e.toLowerCase()));
-
-  // Try the bare name too (some environments provide an extensionless shim).
-  return [bin, ...exts.map((ext) => bin + ext)];
-}
-
-export function findBin(bin: string, dirs = searchDirs()): string | null {
-  for (const dir of dirs) {
-    for (const candidate of binCandidates(bin)) {
-      const p = path.join(dir, candidate);
-      try {
-        fs.accessSync(p, fs.constants.X_OK);
-        return p;
-      } catch {
-        /* not here */
-      }
-    }
-  }
-  return null;
-}
-
-export function detectClis() {
+export function detectClis(root?: string) {
   const dirs = searchDirs();
+  // Models come from the cache scan-cli-models.mjs writes, never from a list
+  // hardcoded here: the sets move when a vendor ships a tier or you switch
+  // accounts. A missing cache just means no model picker yet.
+  const cached = readModelCache(root) as { clis?: Record<string, { models?: string[] }> } | null;
   return KNOWN.map((c) => {
     const found = findBin(c.bin, dirs);
+    const models = cached?.clis?.[c.id]?.models ?? [];
     return {
       id: c.id, name: c.name, run: c.run, url: c.url, installed: !!found, path: found,
-      // What the Config picker may offer for this CLI. `supportsModel` rather
-      // than a model list: only some CLIs can enumerate their models, and any
-      // list we hardcoded would be stale the week a new one ships.
-      supportsModel: !!c.modelArgs,
+      // A single model is not a choice — the picker hides rather than showing a
+      // dropdown you cannot change. Deciding that here keeps the rule in one
+      // place instead of duplicated in the UI.
+      models: c.modelArgs && models.length > 1 ? models : [],
       efforts: c.efforts ?? [],
     };
   });
@@ -150,3 +100,5 @@ export function resolveCli(id: string): { spec: CliSpec; binPath: string } | nul
   if (!binPath) return null;
   return { spec, binPath };
 }
+
+export { findBin };

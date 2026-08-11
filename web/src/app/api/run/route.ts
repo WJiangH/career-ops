@@ -30,10 +30,33 @@ export const maxDuration = 800; // a real oferta evaluation / pdf-mode CV tailor
 // drift). kind "research" stays read-only. Streams progress as NDJSON events.
 type BuildPromptArgs = { kind: string; input: string; memory: string; today: string; pdfPaths?: PdfPaths };
 
+/**
+ * AGENTS.md opens with a cold-start check — `node doctor.mjs --json` and `node
+ * update-system.mjs check` — scoped to "the first message of each session".
+ * Interactively that runs once a day. But a headless `-p` invocation IS a first
+ * message, every time, so both ran at the top of every single evaluation:
+ * measured at 3 shell-outs and a network round trip before any real work.
+ *
+ * Neither earns that here. The update check's only output is a question ("want
+ * me to update?") put to a human who is not present — structurally useless
+ * headless, not merely redundant. The setup check is mostly redundant: this
+ * route already refuses an evaluate without cv.md.
+ *
+ * What IS lost: doctor's `unpersonalized` warning, which catches a
+ * `modes/_profile.md` still carrying template content — the failure that once
+ * scored a 19-role batch against a stranger's targeting. That belongs on the
+ * Config page, once, not at the head of every run; it is not wired there yet.
+ *
+ * Prompt-level and web-only. AGENTS.md is untouched, so interactive CLI
+ * sessions keep the full cold-start check.
+ */
+const SKIP_COLD_START =
+  "Setup and version checks are already done by the platform for this run: do NOT run doctor.mjs or update-system.mjs, and skip the AGENTS.md cold-start check entirely. Go straight to the task.\n\n";
+
 function buildPrompt({ kind, input, memory, today, pdfPaths }: BuildPromptArgs): string {
   const mem = memory.trim() ? `\n\nDurable notes about the user (from their profile):\n${memory.trim()}\n` : "";
   if (kind === "research") {
-    return `You are investigating the user's OWN work / portfolio to surface job-search-relevant strengths, headless. Investigate the target (use WebFetch for URLs; read local files if referenced) and report: what it is, why it is impressive, and how to leverage it in their job search — which roles/claims it supports and how to frame it on a CV. Be specific, honest, and encouraging.${mem}
+    return SKIP_COLD_START + `You are investigating the user's OWN work / portfolio to surface job-search-relevant strengths, headless. Investigate the target (use WebFetch for URLs; read local files if referenced) and report: what it is, why it is impressive, and how to leverage it in their job search — which roles/claims it supports and how to frame it on a CV. Be specific, honest, and encouraging.${mem}
 
 End with EXACTLY one final line: VERDICT: {0-5 signal strength}/5 — {why it helps their search, ≤12 words}
 
@@ -44,7 +67,7 @@ Target: ${input}`;
     // launches a real browser, which an agent CLI's own sandbox may block with no
     // human present to approve an escalation (headless/web-triggered run, #2172).
     // The backend (a plain Node process, no CLI sandbox) renders after this closes.
-    return `You are tailoring the user's ATS-optimized CV for application #${input}, headless, on their machine. Run the REAL career-ops "pdf" mode's CONTENT step — follow modes/pdf.md EXACTLY for tailoring (do not improvise a format).
+    return SKIP_COLD_START + `You are tailoring the user's ATS-optimized CV for application #${input}, headless, on their machine. Run the REAL career-ops "pdf" mode's CONTENT step — follow modes/pdf.md EXACTLY for tailoring (do not improvise a format).
 1. Read modes/pdf.md, cv.md, config/profile.yml, and the evaluation report at reports/${input}-*.md (for the JD keywords + analysis).
 2. Tailor the CV per modes/pdf.md: inject the JD's keywords into the summary + first bullets, reorder experience by relevance, build the competency grid, pick the top 3–4 projects. NEVER invent skills — only reword REAL experience using the JD's vocabulary.
 3. Fill templates/cv-template.html's {{...}} placeholders with the tailored content; write the HTML to EXACTLY this path: ${pdfPaths?.html}
@@ -55,7 +78,7 @@ Do NOT run generate-pdf.mjs yourself and do NOT render a PDF — the platform re
 End with EXACTLY one final line: VERDICT: {5 if the HTML and format file were written, else 1}/5 — {a one-line summary, ≤12 words}`;
   }
   if (kind === "fix-portal") {
-    return `A company's job-portal ATS slug is BROKEN — career-ops can no longer scan it, so it silently disappears from every future scan. Repair it (headless, on the user's machine):
+    return SKIP_COLD_START + `A company's job-portal ATS slug is BROKEN — career-ops can no longer scan it, so it silently disappears from every future scan. Repair it (headless, on the user's machine):
 1. Run \`node verify-portals.mjs --add "${input}"\` — it probes Greenhouse/Ashby/Lever for the company's correct ATS slug and prints the suggested ats + slug.
 2. Open portals.yml, find the "${input}" entry under tracked_companies, and update its careers_url (and any api/slug field) to the suggested WORKING ATS URL. Change ONLY this one company; preserve all other YAML structure, comments and formatting exactly.
 3. Re-run \`node verify-portals.mjs\` and confirm "${input}" now shows ✅ live (not ❌).
@@ -64,7 +87,7 @@ If NO slug variant resolves, say so clearly and leave portals.yml unchanged. Nev
 End with EXACTLY one final line: VERDICT: {5 if now live, else 1}/5 — {what you changed, ≤12 words}`;
   }
   // evaluate (default) — run the REAL oferta mode + persist canonically
-  return `You are running the OFFICIAL career-ops job evaluation, HEADLESS, on the user's own machine. Today is ${today}. Run the REAL career-ops evaluation — do NOT improvise your own scoring.
+  return SKIP_COLD_START + `You are running the OFFICIAL career-ops job evaluation, HEADLESS, on the user's own machine. Today is ${today}. Run the REAL career-ops evaluation — do NOT improvise your own scoring.
 
 1. Read modes/oferta.md and follow it EXACTLY (blocks A–F, G posting-legitimacy, and the Machine Summary). Ground the fit in THIS person: read cv.md, config/profile.yml, modes/_profile.md, and modes/_custom.md (if it exists). modes/_shared.md states the precedence and it is binding here too: _profile.md overrides the mode's defaults, and _custom.md's house rules are honored in every mode — an instruction recorded there is NOT optional. In particular, detect the archetype against _profile.md's table, never a list hardcoded in the mode file. Use WebFetch to read the posting (you are headless — Playwright is unavailable, so use WebFetch and mark the report header "Verification: unconfirmed (batch mode)").
 
