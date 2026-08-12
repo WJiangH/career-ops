@@ -85,16 +85,17 @@ test("non-string entries are dropped, not passed through", () => {
   assert.deepEqual(kws, ["Good", "Also Good"]);
 });
 
-// ── parity with the core helper ──────────────────────────────────────────────
-
-test("matches providers/_profile-keywords.mjs on the same input", async () => {
-  // The module exists because a hand-written copy drifted. Assert the parity
-  // directly against the core's implementation — the test runs under plain
-  // Node, so the root import Turbopack refuses at build time is available here.
-  const { profileTargetKeywords: core } = await import("../../../providers/_profile-keywords.mjs");
-  const doc = yaml.load(readFileSync(new URL("../../../config/profile.example.yml", import.meta.url), "utf8"));
-  // The core de-dupes and trims; this one returns raw strings for the caller's
-  // cleanChips to handle. Compare as sets so the contract compared is "the same
-  // keywords", not "the same post-processing".
-  assert.deepEqual(new Set(profileTargetKeywords(doc)), new Set(core(doc)));
-});
+// ── parity with the core helper lives in the ROOT suite ──────────────────────
+//
+// tests/profile-keywords-parity.test.mjs asserts this module against
+// providers/_profile-keywords.mjs — the drift it was extracted to stop.
+//
+// It cannot live here. web-ci.yml runs `npm ci` inside web/ only, so importing
+// a core module — which resolves js-yaml from the repo ROOT's node_modules —
+// fails with ERR_MODULE_NOT_FOUND. Suites under web/tests/ must be runnable on
+// web/'s dependencies alone; the root suite is where a cross-boundary invariant
+// belongs, and is the required check besides. Same direction of reach, and the
+// same reasoning, as tests/web-test-layout.test.mjs.
+//
+// Reading a root FILE stays fine and is used above: readFileSync needs no
+// package resolution.
