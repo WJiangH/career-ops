@@ -56,7 +56,18 @@ export default function JobPage({ params }: { params: Promise<{ id: string }> })
         </div>
       </section>
 
-      <ol className="mt-6 space-y-2">
+      {/* The trace is HOW the run went; the verdict is what it produced. While
+          running it is the only signal and stays open. Once a verdict exists it
+          collapses — otherwise ~20 tool lines sit at full weight between the
+          header and the verdict card, pushing the answer below the fold and
+          giving process the same prominence as result. Same demotion the
+          narration below already gets, for the same reason. */}
+      <details className="group mt-6" open={job.status === "running" || !job.tldr}>
+        <summary className="cursor-pointer list-none text-xs font-semibold uppercase tracking-[0.2em] text-muted marker:content-['']">
+          <span className="group-open:hidden">Show what the agent did ({job.steps.length} steps)</span>
+          <span className="hidden group-open:inline">Agent steps</span>
+        </summary>
+      <ol className="mt-3 space-y-2">
         {job.steps.map((s, i) => (
           <li key={i} className="flex items-start gap-2.5 text-sm">
             {s.kind === "tool" ? (
@@ -82,6 +93,7 @@ export default function JobPage({ params }: { params: Promise<{ id: string }> })
           </li>
         )}
       </ol>
+      </details>
 
       {/* The verdict, when the run produced one. The agent writes its real
           output to reports/{num}-{slug}-{date}.md and only narrates on the
@@ -128,11 +140,27 @@ export default function JobPage({ params }: { params: Promise<{ id: string }> })
               ) : null,
             )}
 
-            {job.tldr.report && (
-              <p className="mt-5 text-sm">
-                <a className="text-brand underline underline-offset-4" href={`/pipeline`}>Full report · {job.tldr.report.replace("reports/", "")}</a>
-              </p>
-            )}
+            {/* The report number IS the route: /pipeline/48 renders
+                reports/048-*.md. This pointed at bare /pipeline, which lands on
+                the INBOX tab — so the report was one unguessable click away and
+                read as missing, worst of all for a SKIP whose tracker row sits
+                under a tab you'd have to know to open. No leading number means
+                no route to derive, so show plain text rather than a wrong link. */}
+            {job.tldr.report && (() => {
+              const file = job.tldr.report.replace("reports/", "");
+              const num = /^(\d+)/.exec(file)?.[1];
+              return (
+                <p className="mt-5 text-sm">
+                  {num ? (
+                    <Link className="text-brand underline underline-offset-4" href={`/pipeline/${num}`}>
+                      Full report · {file}
+                    </Link>
+                  ) : (
+                    <span className="text-muted">Full report · {file}</span>
+                  )}
+                </p>
+              );
+            })()}
           </div>
         </div>
       )}
