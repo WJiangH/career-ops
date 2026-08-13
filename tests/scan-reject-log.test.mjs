@@ -7,7 +7,7 @@
 // filter path directly.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordTitleReject, flushTitleRejects, rejectBufferSize, buildTitleFilter, buildLocationFilter } from '../scan.mjs';
@@ -72,9 +72,24 @@ test('tabs and newlines in a scraped title cannot shear the columns', () => {
 });
 
 test('an unwritable path fails silently — a scan is never lost over its telemetry', () => {
+  // The unwritable path has to be unwritable on every runner, and the obvious
+  // spellings are not. `/proc/...` is only special on Linux: on Windows it
+  // resolves to C:\proc\... and flush's `mkdirSync(recursive)` CREATES it under
+  // the runner's admin token, so the write succeeds and this assertion fails on
+  // exactly the platform that never sees a /proc. chmod is no better — it is a
+  // no-op for the owner on Windows.
+  //
+  // A regular FILE standing where a directory must be is refused identically
+  // everywhere (ENOTDIR on POSIX, ENOENT/ENOTDIR on Windows), by the filesystem
+  // rather than by permissions, so it needs no privileges to set up and cannot
+  // be defeated by having too many.
+  const blocked = join(mkdtempSync(join(tmpdir(), 'co-rej-')), 'not-a-directory');
+  writeFileSync(blocked, 'this is a file, not a directory');
+
   recordTitleReject('Some Title', 'Co', 'lever');
-  assert.equal(flushTitleRejects('/proc/definitely/not/writable/x.tsv'), 0);
+  assert.equal(flushTitleRejects(join(blocked, 'scan-rejects.tsv')), 0);
   assert.equal(rejectBufferSize(), 0, 'buffer still drained, so the next flush is clean');
+  rmSync(blocked, { force: true });
 });
 
 test('passesFilters records the titles it rejects', () => {
