@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
 import { cleanChips, CHIP_CAP } from "../../src/lib/clean-chips.mjs";
 
 /** Split a raw input string the same way filter-builder's commit() does —
