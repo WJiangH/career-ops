@@ -25,7 +25,7 @@
 import { pass, fail, ROOT } from './helpers.mjs';
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import { profileTargetKeywords as core } from '../providers/_profile-keywords.mjs';
 import { profileTargetKeywords as web } from '../web/src/lib/profile-keywords.mjs';
 

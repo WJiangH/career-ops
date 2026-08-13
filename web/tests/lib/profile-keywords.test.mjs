@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
 import { profileTargetKeywords } from "../../src/lib/profile-keywords.mjs";
 
 // ── the shapes that exist on disk ────────────────────────────────────────────
