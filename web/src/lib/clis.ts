@@ -36,6 +36,7 @@ function searchDirs(): string[] {
     path.join(home, ".npm-global/bin"),
     path.join(home, ".bun/bin"),
     path.join(home, ".deno/bin"),
+    path.join(home, ".opencode/bin"),
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
