@@ -165,6 +165,20 @@ Forcing it into the nearest available label — or into a "hybrid" of two —
 manufactures a confident fit narrative for a job the user is not applying for,
 which is worse than a low score because it reads as analysis.
 
+**A match against the default table below is not a match against the user's
+targets.** Where `_profile.md` defines archetypes, "targeted" means one of
+those. An offer that lands cleanly on a default row and on nothing in
+`_profile.md` is still an unmatched offer: name the default archetype if it
+helps explain the role, and score North Star as unmatched anyway. Reading the
+fallback as a target is the exact failure this section exists to stop — it is
+how a program-management req came back as "Technical AI PM / AI Transformation
+Lead (hybrid)" for a candidate who targets neither.
+
+On the number: `modes/ofertas.md` already anchors this dimension at
+`5 = exact target role, 1 = unrelated`. Unmatched sits at the bottom of that
+scale, not in the middle — the offer is not one the user is looking for, and a
+mid score reads as a partial fit that does not exist.
+
 | Archetype | Key signals in JD |
 |-----------|-------------------|
 | AI Platform / LLMOps | "observability", "evals", "pipelines", "monitoring", "reliability" |
