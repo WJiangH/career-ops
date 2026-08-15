@@ -14808,6 +14808,53 @@ try {
   } else {
     fail('titles mode missing error handling for absent cv.md / portals.yml');
   }
+
+  // A mode that can only ADD keeps whatever the list started as — on day zero
+  // that is the template's 37, copied on doctor's instruction. #2751.
+  if (
+    titlesFlat.includes('may be proposed for removal on exactly one ground') &&
+    titlesFlat.includes('`cv.md` does not support it')
+  ) {
+    pass('titles mode can retire a keyword, on CV evidence alone');
+  } else {
+    fail('titles mode should be able to propose removals, grounded in cv.md');
+  }
+
+  // The user-layer guarantee. portals.yml may hold an evening of hand-pruning,
+  // so removal is per-keyword and confirmed, never a regeneration.
+  if (
+    titlesFlat.includes('There is no bulk "replace" and no silent rewrite') &&
+    titlesFlat.includes('one keyword at a time')
+  ) {
+    pass('titles mode never regenerates a curated portals.yml — removals are per-keyword and confirmed');
+  } else {
+    fail('titles mode missing the no-silent-rewrite guarantee for the user-layer portals.yml');
+  }
+
+  // Emptying `positive` makes the scanner match every posting on every board —
+  // strictly worse than the wrong keyword the removal was meant to fix.
+  if (titlesFlat.includes('the last remaining positive keyword')) {
+    pass('titles mode refuses to remove the last positive keyword');
+  } else {
+    fail('titles mode should refuse to empty title_filter.positive');
+  }
+
+  // The way out of an empty list is the CV this mode already reads; the
+  // template is the second option, not the first (#2751).
+  if (
+    titlesFlat.includes('derive the list from `cv.md` here rather than sending the user away') &&
+    titlesFlat.includes('or start from an example and edit it')
+  ) {
+    pass('titles mode answers an empty positive list from cv.md, with the template offered second');
+  } else {
+    fail('titles mode should derive from cv.md on an empty list rather than pointing at the template first');
+  }
+
+  if (titlesFlat.includes('ONE diff under separate headings')) {
+    pass('titles mode shows additions and removals in one diff, under separate headings');
+  } else {
+    fail('titles mode should show removals under their own heading in the same diff');
+  }
 } catch (e) {
   fail(`modes/titles.md missing or unreadable: ${e.message}`);
 }
