@@ -14833,6 +14833,18 @@ try {
 
   // Emptying `positive` makes the scanner match every posting on every board —
   // strictly worse than the wrong keyword the removal was meant to fix.
+  // The failure mode that makes removal dangerous: reading "cv.md does not
+  // support it" as a string test. On one real setup 39 of 49 curated keywords
+  // are absent from cv.md as strings, and most of them are correct. #2751.
+  if (
+    titlesFlat.includes('never that it contains the word') &&
+    titlesFlat.includes('plausible candidate for a posting carrying this keyword')
+  ) {
+    pass('titles mode defines removal support as capability, not wording');
+  } else {
+    fail('titles mode must say that CV support means the capability, not the literal keyword');
+  }
+
   if (titlesFlat.includes('the last remaining positive keyword')) {
     pass('titles mode refuses to remove the last positive keyword');
   } else {

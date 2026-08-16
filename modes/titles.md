@@ -135,6 +135,24 @@ support it.** Not "it looks unrelated", not "it seems too broad" — the same
 evidence bar the additions are held to, applied in the other direction. If you
 cannot say which line of the CV is missing, do not propose the removal.
 
+**"Support" means the CV evidences the CAPABILITY, never that it contains the
+word.** This is the same rule the suggestions run on — the market's word for a
+capability is usually not the CV's — and getting it backwards here is the way
+this feature does damage. Measured on one real setup: of 49 curated keywords,
+**39 do not appear anywhere in `cv.md` as a string**, and among those 39 are
+`AI Engineer`, `Deep Learning`, `Research Engineer`, `Compiler`, `MLIR` and
+`CUDA` — every one of them a legitimate target for a CV whose summary reads
+*"LLM inference optimization and on-device / edge AI deployment"* and whose
+bullets describe *"kernel- and graph-level optimizations"*. A string test would
+have proposed deleting three quarters of a working filter.
+
+So before proposing any removal, ask the question in this form: **is there work
+in `cv.md` that would make this person a plausible candidate for a posting
+carrying this keyword?** If yes, keep it, whatever words the CV used. Only when
+the answer is no — no line, no adjacent capability, nothing the keyword could
+be reaching for — is it a candidate for removal, and then it still goes through
+the diff with its reason.
+
 Two cases, and they are told apart by what the current list is:
 
 1. **The list is still the shipped example.** `title_filter.positive` matches
