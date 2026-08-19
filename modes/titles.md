@@ -155,12 +155,18 @@ the diff with its reason.
 
 Two cases, and they are told apart by what the current list is:
 
-1. **The list is still the shipped example.** `title_filter.positive` matches
-   `templates/portals.example.yml`, so nothing in it was chosen — it was copied
-   because `doctor` said to copy it. Say that plainly ("these 37 keywords are
-   the template's defaults, not yours"), and propose the full CV-derived set
-   with the unsupported template keywords listed for removal. This is the
-   day-zero case and the reason this mode can remove at all.
+1. **The list is still byte-identical to the shipped example.**
+   `title_filter.positive` matches `templates/portals.example.yml`, which is
+   evidence it was never edited — `doctor` copies the template, so an untouched
+   install lands exactly here. But it is an **inference, not a record**:
+   `portals.yml` stores keywords, never who put them there. So state it as an
+   inference the user can correct — *"this list is still identical to the
+   shipped example, so I am reading it as defaults rather than your choices;
+   say if any of them are actually yours"* — and then propose the full
+   CV-derived set with the unsupported template keywords listed for removal.
+   This is the day-zero case and the reason this mode can remove at all. If the
+   user names even one keyword as theirs, the list was chosen after all: drop to
+   case 2 for the rest of the session.
 2. **The list has been edited.** Then some of it was chosen, and you cannot
    tell which. Propose removals only for keywords with no CV support, list them
    individually with the reason, and default to keeping anything you are unsure
@@ -169,7 +175,11 @@ Two cases, and they are told apart by what the current list is:
 
 **Never remove:**
 
-- a keyword the user added during this session or a previous run of this mode
+- a keyword the user added during this session. **`portals.yml` records no
+  provenance**, so "the user added this in a previous run" is not a fact you can
+  check — treat it as unknowable rather than as false. That is what case 2's
+  default-to-keep is for; never reason that a keyword must be the template's
+  merely because you did not watch it being added.
 - anything in `title_filter.negative` — this mode does not touch exclusions
 - the last remaining positive keyword. An empty `positive` means the scanner
   matches every posting on every board, which is a worse state than a wrong
@@ -190,14 +200,19 @@ a `-` at the start of a line.
 
 - `cv.md` missing → stop and point at onboarding (`node doctor.mjs --json`).
   There is no evidence base to suggest from, and inventing one is forbidden.
-- `portals.yml` missing, or `title_filter.positive` empty → **derive the list
-  from `cv.md` here rather than sending the user away to copy an example.** An
+- `portals.yml` missing, or `title_filter` / `title_filter.positive` absent or
+  empty → **derive the list from `cv.md` here rather than sending the user away
+  to copy an example.** An absent key and an empty list are the same thing to
+  the scanner — both match every posting — so handle them the same way. An
   empty positive list means the scanner matches every posting, so it cannot be
   left empty — but the way out of empty is the CV, which this mode already
   reads. Offer `templates/portals.example.yml` second, as *"or start from an
   example and edit it"*, for a user who would rather begin from a shape than
   from their own history. Copying the example is a valid choice; it is not the
-  default, because what it copies is someone else's market.
+  default, because what it copies is someone else's market. Write back the
+  `title_filter` key alone: every other key in `portals.yml` — the company list
+  above all — is outside this mode's ownership and must survive the write
+  unchanged.
 - `config/profile.yml` or `modes/_profile.md` missing → **hard stop**: do not
   generate suggestions. Point at onboarding (`node doctor.mjs --json`) and
   stop, then re-run this mode once both files exist — the same
