@@ -31,12 +31,25 @@ function runDoctor(cwd) {
 
 // Builds a target dir carrying the REAL templates, so the test tracks whatever
 // placeholder vocabulary the shipped templates actually use.
-function fixture(label) {
+function fixture(label, { seedPrereqs = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), `co-unfilled-${label}-`));
   dirs.push(dir);
   mkdirSync(join(dir, 'modes'), { recursive: true });
+  mkdirSync(join(dir, 'config'), { recursive: true });
   for (const f of ['_profile.template.md', '_brief.template.md', '_custom.template.md']) {
     writeFileSync(join(dir, 'modes', f), readFileSync(join(ROOT, 'modes', f), 'utf-8'));
+  }
+  // The prerequisites doctor gates onboarding on. Only the non-blocking case
+  // needs them, and it needs them for a specific reason: without cv.md,
+  // config/profile.yml and portals.yml, `onboardingNeeded` is true because
+  // those are MISSING, and a test that then finds warnings has proved nothing
+  // about whether an unpersonalized file gates anything. Caught by CodeRabbit
+  // on this PR — reproduced before fixing: the fixture reported
+  // `onboardingNeeded: true, missing: ["cv.md","config/profile.yml","portals.yml"]`.
+  if (seedPrereqs) {
+    writeFileSync(join(dir, 'cv.md'), '# Jane Smith\n\n## Experience\n\n### Engineer — Acme\n');
+    writeFileSync(join(dir, 'config', 'profile.yml'), 'candidate:\n  full_name: "Jane Smith"\n');
+    writeFileSync(join(dir, 'portals.yml'), 'title_filter:\n  positive:\n    - "Engineer"\n');
   }
   return dir;
 }
@@ -60,14 +73,27 @@ try {
 
   // 2. Non-blocking: an unedited personalization file is a warning, never a
   //    gate. career-ops is documented as working out of the box.
+  //
+  //    Every prerequisite is present here, so `onboardingNeeded` has exactly
+  //    one thing left it could be reacting to. That is the whole assertion:
+  //    without the seed it is true because cv.md and friends are absent, and
+  //    "warnings exist AND onboarding is needed" is equally consistent with the
+  //    gate this PR must not introduce.
   {
-    const dir = fixture('nonblocking');
+    const dir = fixture('nonblocking', { seedPrereqs: true });
     const s = runDoctor(dir);
     if (s._error) fail(`non-blocking: doctor crashed: ${s._error}`);
-    else if ((s.unpersonalized || []).length > 0 && s.warnings.some((w) => w.includes('_profile.md'))) {
-      pass('unpersonalized files surface in warnings without gating onboarding');
+    else if ((s.missing || []).length > 0) {
+      fail(`non-blocking: fixture is not complete, so the gate is untestable: missing ${JSON.stringify(s.missing)}`);
+    } else if (
+      s.onboardingNeeded === false &&
+      (s.unpersonalized || []).length > 0 &&
+      s.warnings.some((w) => w.includes('_profile.md'))
+    ) {
+      pass('an unpersonalized file warns and reports onboardingNeeded false — a signal, not a gate');
     } else {
-      fail('unpersonalized files did not reach the warnings array');
+      fail(`unpersonalized gated onboarding or never warned: onboardingNeeded=${s.onboardingNeeded}, ` +
+        `unpersonalized=${JSON.stringify((s.unpersonalized || []).map((u) => u.path))}`);
     }
   }
 

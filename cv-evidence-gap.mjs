@@ -28,13 +28,15 @@
  */
 
 import { readFileSync, existsSync, readdirSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 import { canonicalize } from './skill-extract.mjs';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
-const CV = join(ROOT, 'cv.md');
-const REPORTS = join(ROOT, 'reports');
+// User-layer files (cv.md, portals.yml, data/, reports/) live under the data
+// root, which CAREER_OPS_ROOT may point away from the codebase.
+const USER_ROOT = getCareerOpsRoot();
+const CV = join(USER_ROOT, 'cv.md');
+const REPORTS = join(USER_ROOT, 'reports');
 
 /**
  * Split cv.md into the skills inventory and the prose that could evidence it.

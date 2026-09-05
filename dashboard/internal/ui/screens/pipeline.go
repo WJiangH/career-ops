@@ -92,6 +92,9 @@ type PipelineRefreshMsg struct{}
 // PipelineOpenProgressMsg is emitted when the progress screen should open.
 type PipelineOpenProgressMsg struct{}
 
+// PipelineOpenStatsMsg is emitted when the stats (dimension breakdown) screen should open.
+type PipelineOpenStatsMsg struct{}
+
 var canonicalDiscardReasons = []string{
 	"salary_too_low",
 	"hybrid_required",
@@ -109,7 +112,7 @@ type reportSummary struct {
 	comp      string
 }
 
-const storyTemplateURL = "https://github.com/santifer/career-ops/issues/new?template=i-got-hired.yml"
+const storyTemplateURL = "https://github.com/career-ops-hq/career-ops/issues/new?template=i-got-hired.yml"
 
 // Sort modes
 const (
@@ -600,7 +603,11 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 		}
 
 	case "o":
-		if app, ok := m.CurrentApp(); ok && app.JobURL != "" {
+		if app, ok := m.CurrentApp(); ok {
+			if app.JobURL == "" {
+				m.flash = "No URL found for this application"
+				break
+			}
 			return m, func() tea.Msg {
 				return PipelineOpenURLMsg{URL: app.JobURL}
 			}
@@ -663,6 +670,9 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 
 	case "p":
 		return m, func() tea.Msg { return PipelineOpenProgressMsg{} }
+
+	case "S":
+		return m, func() tea.Msg { return PipelineOpenStatsMsg{} }
 
 	case "r":
 		return m, func() tea.Msg { return PipelineRefreshMsg{} }
@@ -1569,11 +1579,42 @@ func (m PipelineModel) columnWidths() colWidths {
 		c.posted = 10
 	}
 	fixed := c.num + c.score + c.date + c.company + c.status + c.loc + c.pay + c.rpt + c.pdf + c.last + c.posted
-	c.role = m.width - fixed - 14 // separators + outer padding
+	c.role = m.width - fixed - m.rowOverhead(c)
 	if c.role < 15 {
 		c.role = 15
 	}
 	return c
+}
+
+// rowOverhead is everything a rendered row costs beyond the column widths
+// themselves. It is NOT a constant: renderAppLine and renderColumnHeader join
+// the segments with one space each, so the cost grows by one for every optional
+// column turned on.
+//
+// It used to be a fixed 14, which is the value for all seven optional columns
+// visible — so the full layout landed exactly on the terminal edge while every
+// narrower layout was left up to 7 runes short of the width it had been given.
+// Deriving it from the visible segments keeps the row the same width in every
+// combination, and keeps a future eighth column from silently taking it over.
+func (m PipelineModel) rowOverhead(c colWidths) int {
+	segments := 5 // #, score, company, role, status — always rendered
+	for _, w := range []int{c.date, c.loc, c.pay, c.rpt, c.pdf, c.last, c.posted} {
+		if w > 0 {
+			segments++
+		}
+	}
+	const (
+		leadingSpace = 1 // the " " prefixed before the join
+		outerPadding = 4 // lipgloss Padding(0, 2) — two runes on each side
+		// The score segment is budgeted c.score above but rendered unpadded, so
+		// the budget gets the difference back. Measured against the DATA row,
+		// where the score is always fmt.Sprintf("%.1f") — three runes. The
+		// header uses the ColFit label instead, which is wider in some locales
+		// ("UYUM", "AJUSTE"); that pre-existing header/row drift is not
+		// something the role width can fix for both at once.
+		renderedScoreWidth = 3
+	)
+	return (segments - 1) + leadingSpace + outerPadding - (c.score - renderedScoreWidth)
 }
 
 func (m PipelineModel) workModeColor(mode string) lipgloss.Color {
@@ -1634,6 +1675,14 @@ func (m PipelineModel) renderPostedCell(app model.CareerApplication, width int) 
 	}
 	posted, err := time.Parse("2006-01-02", app.PostedOn)
 	if err != nil {
+		return lipgloss.NewStyle().Foreground(m.theme.Subtext).Width(width).Render("—")
+	}
+	// A requisition cannot have gone live in the future. Such a date is bad data
+	// (a typo, or a provider field that isn't the posting date at all), and it
+	// would otherwise read as the freshest possible req: time.Since is negative,
+	// which lands in the first case below and paints it green — the one colour
+	// that says "act on this now".
+	if posted.After(time.Now()) {
 		return lipgloss.NewStyle().Foreground(m.theme.Subtext).Width(width).Render("—")
 	}
 	days := int(time.Since(posted).Hours() / 24)
@@ -1959,6 +2008,7 @@ func (m PipelineModel) renderHelp() string {
 		keyStyle.Render("C") + descStyle.Render(i18n.Current.HelpColumns) +
 		keyStyle.Render("v") + descStyle.Render(i18n.Current.HelpView) +
 		keyStyle.Render("p") + descStyle.Render(i18n.Current.HelpProgress) +
+		keyStyle.Render("S") + descStyle.Render(i18n.Current.HelpStats) +
 		keyStyle.Render("t") + descStyle.Render(i18n.Current.HelpLanguage) +
 		keyStyle.Render("m") + descStyle.Render(i18n.Current.HelpManifesto) +
 		keyStyle.Render("q") + descStyle.Render(i18n.Current.HelpQuit)

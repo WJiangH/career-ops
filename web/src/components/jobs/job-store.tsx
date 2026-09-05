@@ -2,6 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { scoreTone } from "@/lib/format";
+import { CONFIG_KEY, readSavedCliId, resolveCliId } from "@/lib/saved-cli";
 
 // `detail` is the tool's argument (file read, command run, query searched).
 // Optional: a CLI may not ship one, and an unrecognised argument shape yields none.
@@ -56,7 +57,6 @@ export function useJobs() {
   return c;
 }
 
-const CONFIG_KEY = "career-ops:config";
 const JOBS_KEY = "career-ops:jobs";
 
 function parseVerdict(text: string): JobResult {
@@ -191,22 +191,6 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
 
   const startJob = useCallback(
     (opts: StartOpts): string | null => {
-      let cliId: string | null = null;
-      // Model/effort are keyed by CLI in Config: "xhigh" is valid on claude and
-      // codex but not grok, and a model name means nothing to another vendor.
-      let model: string | undefined;
-      let effort: string | undefined;
-      try {
-        const raw = localStorage.getItem(CONFIG_KEY);
-        const cfg = raw ? JSON.parse(raw) : null;
-        cliId = cfg?.cliId || null;
-        if (cliId) {
-          model = cfg?.models?.[cliId] || undefined;
-          effort = cfg?.efforts?.[cliId] || undefined;
-        }
-      } catch {
-        cliId = null;
-      }
       const id = `job-${Date.now()}-${seq.current++}`;
       const job: Job = {
         id,
@@ -223,12 +207,29 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
       };
       setJobs((js) => [job, ...js]);
 
-      if (!cliId) {
-        patch(id, (j) => ({ ...j, status: "error", endedAt: Date.now(), steps: [...j.steps, { kind: "status", label: "No CLI configured — open Config", ts: Date.now() }] }));
-        return id;
-      }
-
       (async () => {
+        const cliId = readSavedCliId() || (await resolveCliId());
+        if (!cliId) {
+          patch(id, (j) => ({
+            ...j,
+            status: "error",
+            endedAt: Date.now(),
+            steps: [...j.steps, { kind: "status", label: "No CLI configured — open Config and click Save config", ts: Date.now() }],
+          }));
+          return;
+        }
+        // Model/effort are keyed by CLI in Config: "xhigh" is valid on claude and
+        // codex but not grok, and a model name means nothing to another vendor.
+        let model: string | undefined;
+        let effort: string | undefined;
+        try {
+          const raw = localStorage.getItem(CONFIG_KEY);
+          const cfg = raw ? JSON.parse(raw) : null;
+          model = cfg?.models?.[cliId] || undefined;
+          effort = cfg?.efforts?.[cliId] || undefined;
+        } catch {
+          /* unreadable config: run with the CLI's defaults */
+        }
         let text = "";
         let verdictLine = ""; // latched separately so the 8000-char tail can't drop it
         let doneTokens = 0; // per-run token cost, forwarded on the done event (#6)

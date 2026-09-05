@@ -1,10 +1,14 @@
+// Both spawners are needed here, and the distinction matters: the agent CLI goes
+// through spawnHeadlessCli (which closes stdin so `codex exec` can't hang waiting
+// on it, #2085), while the PDF render is a plain Node child process with no CLI
+// sandbox in the way (#2172) and so passes `spawn` itself to renderAndMarkPdf.
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveCli } from "@/lib/clis";
-import { parserFor } from "@/lib/cli-stream.mjs";
-import { isStderrFailure } from "@/lib/stderr-classify.mjs";
-import { careerOpsRoot, readMemory, findReportFile } from "@/lib/career-ops";
+import { accumulateTokens, hasNewCompletedReport, isFatalGenericStderr, killMsForKind, timeoutMessage } from "@/lib/run-cli-support.mjs";
+import { spawnHeadlessCli } from "@/lib/spawn-cli.mjs";
+import { careerOpsRoot, readMemory, findReportFile, readInbox, readScanDates, readLanguageConfig } from "@/lib/career-ops";
 import { resolvePdfPaths, type PdfPaths } from "@/lib/pdf-paths.mjs";
 import { renderAndMarkPdf, writeCvHtml, pdfRunOutcome } from "@/lib/pdf-render.mjs";
 import { createCvEnvelopeFilter, type CvEnvelope } from "@/lib/cv-envelope.mjs";
@@ -13,14 +17,6 @@ import { claudeCliArgs } from "@/lib/claude-invocation.mjs";
 import { acquireTrackerWrite, releaseTrackerWrite } from "@/lib/core/run-registry";
 import { appendEvent, createJob, finishJob } from "@/lib/core/job-log";
 import { newReportSince, readMachineSummary, snapshotReports } from "@/lib/machine-summary.mjs";
-
-/** The normalized shape cli-stream.mjs parsers emit, whatever the CLI's dialect. */
-type StreamEvent =
-  | { type: "text"; text: string }
-  | { type: "tool"; name: string; detail?: string }
-  | { type: "status"; label: string }
-  | { type: "usage"; tokens: number; costUsd: number | null }
-  | { type: "error"; msg: string };
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -48,9 +44,18 @@ export async function POST(req: Request) {
 
   // These run the REAL core (modes/scripts), not just data — fail clearly if the
   // root is incomplete instead of faking it.
-  const needsScript: Record<string, string> = { evaluate: "modes/oferta.md", "fix-portal": "verify-portals.mjs", pdf: "generate-pdf.mjs" };
+  // The precondition must check the file the prompt will actually read. Pinning
+  // it to modes/oferta.md meant a configured market passed a check on a file the
+  // run never opens, and would have missed a market dir with no evaluation mode.
+  const lang = readLanguageConfig();
+  const needsScript: Record<string, string> = { evaluate: lang.evalModeFile, "fix-portal": "verify-portals.mjs", pdf: "generate-pdf.mjs" };
   const required = needsScript[kind];
-  if (required && !fs.existsSync(path.join(careerOpsRoot(), required))) {
+  // CAREER_OPS_ROOT is runtime user data, not a build input. Tracing this
+  // dynamic path would copy the whole web project into every server bundle.
+  const requiredPath = required
+    ? path.join(/* turbopackIgnore: true */ careerOpsRoot(), required)
+    : "";
+  if (required && !fs.existsSync(/* turbopackIgnore: true */ requiredPath)) {
     return new Response(
       JSON.stringify({
         error: `This needs a complete career-ops checkout (${required}). CAREER_OPS_ROOT has data only — point it at a full checkout.`,
@@ -98,10 +103,19 @@ export async function POST(req: Request) {
     pdfPaths = pathsResult.paths;
   }
 
-  const prompt = buildPrompt({ kind, input, memory: readMemory(), today });
+  // Resolve the posting date HERE rather than asking the agent for it. The
+  // scanner already wrote it from the provider's own `offer.postedAt`, so this
+  // copies a recorded value instead of inviting a guess — and modes/oferta.md is
+  // explicit that a guessed date is worse than an absent one (the POSTED column
+  // renders absent as `—`, a wrong date as a fresh req). Unknown URL → undefined
+  // → the prompt writes no segment at all.
+  const postedAt =
+    kind === "evaluate"
+      ? readInbox().find((j) => j.url === input)?.postedAt ?? readScanDates().get(input)
+      : undefined;
+  const prompt = buildPrompt({ kind, input, memory: readMemory(), today, postedAt, lang });
 
   const isClaude = cliId === "claude";
-  const parseEvent = parserFor(cliId);
   // Which tools each kind gets, and the whole claude argv, live in
   // claude-invocation.mjs — see its header for the policy and for why it is asserted on
   // built values rather than on this file's source. NEVER auto-submits; that
@@ -112,9 +126,10 @@ export async function POST(req: Request) {
   // as #2507 rather than half-fixed here. On those CLIs the backend is the only
   // INTENDED writer — the agent is not asked to write — but that is mitigation, not
   // enforcement: the capability is still there for an injected posting to reach.
-  // streamArgs only requests structured output; it grants nothing, so it does not
-  // widen that gap, and the route still spells no tool flag itself.
-  const args = isClaude ? claudeCliArgs({ kind, prompt }) : (spec.streamArgs?.(prompt) ?? spec.args(prompt));
+  // A CLI with its own structured stream gets the argv that turns it on, so its
+  // stdout matches spec.parseEvent below; spec.args stays the plain-text argv the
+  // envelope-parsing routes rely on.
+  const args = isClaude ? claudeCliArgs({ kind, prompt }) : (spec.streamArgs ?? spec.args)(prompt);
 
   // Model and effort are opt-in: absent, each CLI uses its own default. Values
   // go in as separate argv entries (never interpolated into a shell), so an odd
@@ -136,16 +151,19 @@ export async function POST(req: Request) {
 
   // For write-needing kinds, snapshot reports/ so we can verify the worker
   // actually persisted (non-Claude CLIs lack Write auth and silently no-op).
+  // Names, not a count: reserving a number writes reports/NNN-RESERVED.md and the
+  // final report REPLACES it, so the `.md` count is unchanged and a count-delta
+  // gate reported "didn't save a report" for an evaluation that saved fine (#2085).
   const reportsDir = path.join(careerOpsRoot(), "reports");
-  const countReports = () => {
+  const reportEntries = () => {
     try {
-      return fs.readdirSync(reportsDir).filter((f) => f.endsWith(".md")).length;
+      return fs.readdirSync(reportsDir);
     } catch {
-      return 0;
+      return [];
     }
   };
   const persists = kind === "evaluate";
-  const reportsBefore = persists ? countReports() : 0;
+  const reportsBefore = persists ? reportEntries() : [];
   // Names, not just a count: identifying the new report by set difference is
   // concurrency-safe, where "newest mtime" would hand one run another's report.
   const reportNamesBefore = persists ? snapshotReports(careerOpsRoot()) : new Set<string>();
@@ -159,17 +177,16 @@ export async function POST(req: Request) {
   // reconnect.
   const jobRunId = jobId && /^[A-Za-z0-9._-]{1,128}$/.test(jobId) ? jobId : `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  // stdin is 'ignore', not the default pipe. The prompt goes in via argv, so the
-  // child never needs stdin — but with an open pipe nobody ever writes to or
-  // ends, a CLI that checks stdin blocks forever waiting for EOF. Codex prints
-  // "Reading additional input from stdin..." and hangs; it has never worked in
-  // the web UI for this reason. Claude masked it by not reading stdin at all.
-  const child = spawn(binPath, args, {
-    cwd: careerOpsRoot(),
-    env: process.env,
-    detached: false,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+
+  // stdin must reach EOF or the CLI waits on piped input that never comes: Codex's
+  // `exec` blocks reading stdin for additional context, hangs until the kill timer,
+  // and then reports a generic "installed and authenticated?" error that reads as an
+  // auth failure even though the CLI is fully signed in. #1973 fixed that here with
+  // an inline `stdio: ["ignore", …]`; spawnHeadlessCli generalizes the same fix to
+  // every CLI-invoking route (assistant, explore/ai, cv/ingest, the apply planners),
+  // which had the identical bug, and puts it behind one tested helper so it cannot
+  // drift back in on any single call site.
+  const child = spawnHeadlessCli(binPath, args, { cwd: careerOpsRoot(), env: process.env });
   // Decode once on the stream, not per chunk. Buffer#toString() decodes each chunk
   // independently, so a chunk boundary falling inside a multi-byte UTF-8 sequence
   // yields a replacement character and mis-decodes the bytes after it. Those bytes
@@ -196,15 +213,15 @@ export async function POST(req: Request) {
   const job = createJob({ id: jobRunId, kind, input, title: `${kind} · ${input.slice(0, 80)}` });
   void job;
   let killer: ReturnType<typeof setTimeout> | undefined;
+  // Declared beside killer, outside the stream, so both send() and cancel()
+  // can clear it the moment the reader goes away; assigned once close() exists.
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
   // pdf-kind's render+mark work (renderPdf, below) keeps running detached even
   // after the agent child closes — and even after a client disconnect fires
   // cancel(). Track its promise so cancel() can defer releasing writeToken
   // until that work actually settles, instead of releasing the tracker-delete
   // guard while mark-pdf-ready.mjs is still actively writing applications.md.
   let pdfRenderPromise: Promise<void> | null = null;
-  // Set by the kill timer so the finished record says "timed out" rather than
-  // the generic "hit an error", which sent us reading logs to tell them apart.
-  let timedOut = false;
   let writeTokenReleased = false;
   const releaseWriteTokenOnce = () => {
     if (writeToken !== null && !writeTokenReleased) {
@@ -216,17 +233,31 @@ export async function POST(req: Request) {
     start(controller) {
       let buf = "";
       let emittedText = false; // any assistant text delta → the CLI actually ran
+      // Set ONLY by an authoritative structured-stream signal (the ev.error branch
+      // in processParsedLine below) — never by flagStderrLine. A stderr keyword
+      // match is a guess, not a verdict; see stderrErrorSnippet.
       let sawError = false;
       let stderrBuf = "";
-      // The pattern, and the per-CLI housekeeping lines exempted from it, live
-      // in stderr-classify.mjs so both can be asserted on as values instead of
-      // by grepping this file. Takes one COMPLETE line.
+      // Fallback for a CLI with no CliSpec.stderrIsFatal of its own. Moved into
+      // run-cli-support.mjs beside the per-CLI classifiers so it has a reachable
+      // test: as an inline regex in this closure nothing could assert it, which
+      // is how a bare `auth` came to match "Authentication successful" and mark a
+      // successful run as failed on six of the eight runtimes (#1974).
+      const isFatalStderr = spec.stderrIsFatal ?? isFatalGenericStderr;
+      // Snippet only, never fatality. isFatalStderr is a keyword guess over a
+      // CLI's own stderr chatter, not a verdict — trusting it to fail the run
+      // outright is exactly the bug #1974 reported: "Authentication successful"
+      // matched a bare `auth` and marked a clean, successful run as an error, on
+      // six of the eight runtimes. The close handler below is the sole place that
+      // decides fatality, from cleanExit and the CLI's own structured error event
+      // (authoritative — see the ev.error branch in processParsedLine); this only
+      // captures human-readable detail for whichever message that decision needs.
+      let stderrErrorSnippet: string | null = null;
       const flagStderrLine = (line: string) => {
-        if (!isStderrFailure(cliId, line)) return;
-        sawError = true;
-        send({ type: "error", msg: line.trim().slice(0, 200) });
+        if (stderrErrorSnippet || !line.trim() || !isFatalStderr(line)) return;
+        stderrErrorSnippet = line.trim().slice(0, 200);
       };
-      let lastTokens = 0; // per-run token cost from the Claude result event (#6) — local only
+      let lastTokens = 0; // per-run token cost from the CLI's structured usage event (#6) — local only
       let lastCostUsd: number | null = null;
       let terminalStatus: "done" | "error" | null = null;
       let terminalSummary = "";
@@ -239,23 +270,25 @@ export async function POST(req: Request) {
       // generate-pdf.mjs mid-render. 600s agent / ~200s render is ample —
       // a Chromium PDF render normally takes low tens of seconds even with a
       // cold Playwright launch.
-      // 285s used to be the non-pdf budget, chosen when the browser held the
-      // connection and a platform timeout was the real ceiling. Runs are
-      // server-owned now, and a genuine oferta evaluation measures 7-8 minutes
-      // — a Workday JD that WebFetch cannot render costs another API round trip
-      // on top. The old value killed real work at 4m45s: observed at exactly
-      // 286s, one second past the timer, mid-sentence after the agent had
-      // already reserved its report number. Both budgets now sit inside the
-      // route's 800s maxDuration with room for pdf's post-agent render.
-      const killMs = kind === "pdf" ? 600_000 : 660_000;
+      // pdf keeps 600s because its render+mark phase runs AFTER this timer; a
+      // plain evaluate has no such phase, so it can use almost the whole 800s
+      // budget. 285s was cutting real evaluations off mid-run — reading the mode
+      // and profile, fetching the posting, ~25 Bash calls and a few web searches
+      // routinely run past it — and the SIGTERM then surfaced as "didn't save a
+      // report" (see the close handler), blaming the CLI for a limit we imposed
+      // (#3124). 780s leaves ~20s under maxDuration for a graceful shutdown.
+      const killMs = killMsForKind(kind);
+      // Set by the killer so the close handler can tell "we timed it out" apart
+      // from "the CLI exited on its own" — different failures, different message.
+      let killedByTimeout = false;
       killer = setTimeout(() => {
-        timedOut = true;
+        killedByTimeout = true;
         try { child.kill("SIGTERM"); } catch { /* ignore */ }
       }, killMs);
       const send = (obj: unknown) => {
         // Latch the terminal outcome from the event itself. sawError only
-        // reflects the stderr regex, so a run failed by an honesty gate — which
-        // reports via send({type:"error"}) — was being recorded as "done".
+        // reflects the structured stream, so a run failed by an honesty gate —
+        // which reports via send({type:"error"}) — was being recorded as "done".
         const t = (obj as { type?: string; msg?: string })?.type;
         if (t === "error") {
           terminalStatus = "error";
@@ -267,17 +300,48 @@ export async function POST(req: Request) {
         // HTTP stream is just one optional consumer of it.
         appendEvent(jobRunId, obj);
         if (closed || clientGone) return;
-        try { controller.enqueue(enc.encode(JSON.stringify(obj) + "\n")); } catch { clientGone = true; }
+        try {
+          controller.enqueue(enc.encode(JSON.stringify(obj) + "\n"));
+        } catch {
+          // The client is gone. The run carries on (see cancel()), but stop the
+          // heartbeat here rather than waiting for close(): the child can still
+          // run for minutes, and a user retrying a failed run would otherwise
+          // accumulate one live timer per abandoned request.
+          clientGone = true;
+          if (heartbeat) clearInterval(heartbeat);
+        }
       };
+      // Time-based keepalive. The stream is silent whenever the agent is thinking
+      // or inside a long tool call, and in pdf mode it is silent for the whole
+      // 15-25 KB <<cv-html>> envelope (cvFilter swallows every byte). Measured
+      // idle gaps on a real pdf run reached 149s — long enough for the browser or
+      // a proxy to drop the connection, after which the client reports
+      // "Connection error" even though the agent finished and the PDF rendered.
+      // It must be a timer, not a hook on incoming text: piggy-backing on agent
+      // output cannot fire during exactly the silences it needs to cover.
+      // Unknown event types are ignored by the client's switch, so old tabs are safe.
+      // Written straight to the response, NOT through send(): a keepalive is
+      // transport, not transcript, and persisting one every 10s would bury the
+      // job log a reconnecting client replays.
+      heartbeat = setInterval(() => {
+        if (closed || clientGone) return;
+        try {
+          controller.enqueue(enc.encode(JSON.stringify({ type: "keepalive" }) + "\n"));
+        } catch {
+          clientGone = true;
+          if (heartbeat) clearInterval(heartbeat);
+        }
+      }, 10_000);
       const close = (outcome?: { status: "done" | "error"; summary?: string; tldr?: Record<string, unknown> }) => {
         if (!closed) {
           closed = true;
+          if (heartbeat) clearInterval(heartbeat);
           if (killer) clearTimeout(killer);
           releaseWriteTokenOnce();
           finishJob(jobRunId, {
             status: outcome?.status ?? terminalStatus ?? (sawError ? "error" : "done"),
-            summary: outcome?.summary ?? (timedOut
-              ? `Timed out after ${Math.round(killMs / 1000)}s — re-run it, or evaluate from the Mac where nothing bounds it.`
+            summary: outcome?.summary ?? (killedByTimeout && !terminalSummary
+              ? timeoutMessage(killMs, kind)
               : terminalSummary || undefined),
             tokens: lastTokens,
             costUsd: lastCostUsd,
@@ -291,6 +355,14 @@ export async function POST(req: Request) {
       // holding the 15-25 KB body out of the run log, which is the agent's
       // narration — see cv-envelope.mjs.
       const cvFilter = kind === "pdf" ? createCvEnvelopeFilter() : null;
+      // While the agent emits the 15-25 KB <<cv-html>> envelope, cvFilter swallows
+      // every byte, so the response stream goes completely silent for as long as
+      // the model takes to write the CV — a minute or more. Nothing downstream can
+      // tell that from a hung request, and the browser/proxy drops the connection;
+      // the client then reports "Connection error" even though the agent is fine
+      // and the PDF renders correctly server-side. Emit a throttled keepalive so
+      // the stream never idles during the filtered phase. Unknown event types are
+      // ignored by the client's switch, so this is safe for older tabs too.
       const sendAgentText = (text: string) => {
         const visible = cvFilter ? cvFilter.push(text) : text;
         if (visible) send({ type: "text", text: visible });
@@ -306,18 +378,42 @@ export async function POST(req: Request) {
         return written.ok;
       };
 
+      // One dispatch for every structured CLI: the per-CLI knowledge (which event
+      // means text/tool/status/usage) lives in run-cli-support.mjs behind
+      // spec.parseEvent, so adding the next such CLI needs no change here.
+      // Shared with the close-time flush below, so a final JSONL line the CLI never
+      // newline-terminates before exiting isn't dropped along with the usage event
+      // it carries.
+      const processParsedLine = (line: string) => {
+        if (!spec.parseEvent) return;
+        const ev = spec.parseEvent(line);
+        if (ev?.text) {
+          emittedText = true;
+          // sendAgentText, NEVER send: pdf's CV arrives inside the agent's text as a
+          // <<cv-html>> envelope, so parsed text has to reach cvFilter too or the
+          // backend has nothing to save and the 25 KB body floods the run log (#2185).
+          sendAgentText(ev.text);
+        }
+        if (ev?.tool) send({ type: "tool", name: ev.tool });
+        if (ev?.status) send({ type: "status", label: ev.status });
+        // Accumulated, not assigned: usage events are per-turn, so overwriting made a
+        // multi-turn run report only its last turn. The authoritative "done" is sent
+        // on close, so the honesty gate decides done-vs-error first.
+        lastTokens = accumulateTokens(lastTokens, ev);
+        if (typeof ev?.costUsd === "number") lastCostUsd = ev.costUsd;
+        if (ev?.error) {
+          sawError = true;
+          send({ type: "error", msg: ev.error.slice(0, 200) });
+        }
+      };
+
       child.stdout.on("data", (chunk: string) => {
         // Deliberately not gated on clientGone: emittedText/sawError feed the
         // honesty gates in child.on("close"), so skipping the parse would make a
         // completed run look like "the CLI produced no output".
         if (closed) return;
-        // No parser → the CLI has no structured mode; show its stdout verbatim.
-        // Usage stays unknown for those, which is honest: there is nothing to read.
-        if (!parseEvent) {
+        if (!spec.parseEvent) {
           emittedText = true;
-          // MERGE HAZARD (#2102): once that PR parses non-Claude stdout as JSONL,
-          // this must move onto the PARSED text or the envelope silently stops
-          // being filtered and collected for codex. git reports no conflict.
           sendAgentText(chunk);
           return;
         }
@@ -326,50 +422,15 @@ export async function POST(req: Request) {
         while ((nl = buf.indexOf("\n")) !== -1) {
           const line = buf.slice(0, nl).trim();
           buf = buf.slice(nl + 1);
-          if (!line) continue;
-          let parsed: unknown;
-          try {
-            parsed = JSON.parse(line);
-          } catch {
-            continue; // partial or non-JSON line
-          }
-          for (const ev of parseEvent(parsed) as StreamEvent[]) {
-            if (ev.type === "text") {
-              emittedText = true;
-              // sendAgentText, not send — this is the hand-off the MERGE HAZARD
-              // note above marks. Now that non-Claude stdout is parsed as JSONL,
-              // its text arrives here instead of the raw-chunk branch; sending it
-              // directly would silently stop the pdf CV envelope being filtered
-              // and collected on codex and grok, with no test failing and no
-              // merge conflict to notice.
-              sendAgentText(ev.text);
-            } else if (ev.type === "tool") {
-              send(ev.detail ? { type: "tool", name: ev.name, detail: ev.detail } : { type: "tool", name: ev.name });
-            } else if (ev.type === "status") {
-              send({ type: "status", label: ev.label });
-            } else if (ev.type === "error") {
-              // Same treatment as a stderr failure: mark it so the honesty gate
-              // records "error", and tell the user the actual reason instead of
-              // the generic no-output message.
-              sawError = true;
-              send({ type: "error", msg: ev.msg.slice(0, 300) });
-            } else if (ev.type === "usage") {
-              // Last-wins: every CLI's final total arrives last, and keeping the
-              // intermediate ones means a run killed mid-flight still records
-              // something. The authoritative "done" is still sent on close, so
-              // the honesty gate decides done-vs-error first.
-              lastTokens = ev.tokens;
-              if (typeof ev.costUsd === "number") lastCostUsd = ev.costUsd;
-            }
-          }
+          if (line) processParsedLine(line);
         }
       });
       child.stderr.on("data", (chunk: string) => {
         // Match on COMPLETE lines. A chunk boundary can fall mid-word, so testing a
         // raw chunk both misses an error split across two of them and can match a
-        // fragment that is not the word it looks like. sawError feeds pdfRunOutcome,
-        // where a false positive fails a run whose PDF rendered fine, so the
-        // boundary has to be settled before the regex sees it.
+        // fragment that is not the word it looks like. The captured snippet only
+        // supplies message text for whichever failure the close handler already
+        // decided on — it never sets sawError itself (see flagStderrLine above).
         stderrBuf += chunk;
         let nl;
         while ((nl = stderrBuf.indexOf("\n")) !== -1) {
@@ -428,13 +489,38 @@ export async function POST(req: Request) {
         // run could still start a brand-new render (and re-touch the tracker)
         // after the stream — and its writeToken guard — is already gone.
         if (closed) return;
+        // A timeout is the ROOT cause behind every "no report / not clean"
+        // symptom the gates below test, so classify it FIRST, for any kind.
+        // Otherwise a run we cut off at the time limit reads as "the CLI couldn't
+        // save a report" and sends the user to re-check a CLI that was working
+        // fine (#3124). code is null here (killed by signal), which the gates
+        // would read as a generic non-clean exit.
+        if (killedByTimeout) {
+          send({
+            type: "error",
+            msg: timeoutMessage(killMs, kind),
+          });
+          return close();
+        }
+        // A final JSONL line with no trailing newline stays in `buf` forever
+        // otherwise — flush it through the same parser so the usage/result event it
+        // usually carries (the last one of a run) isn't lost. Ahead of the pdf branch,
+        // not just the evaluate gate: the pdf path reports lastTokens too.
+        const trailing = buf.trim();
+        if (trailing) {
+          buf = "";
+          processParsedLine(trailing);
+        }
         const cleanExit = code === 0; // non-zero OR null (killed/signal) = NOT clean
         // Shared by both honesty gates below — the pdf gate receives it as
         // pdfRunOutcome's noOutputMessage — because a CLI that produced no output at
         // all is the same failure mode whether it was evaluating or tailoring
         // a PDF — one place for the condition/message pair instead of two.
         const noOutputError = (): string | null => {
-          if (!emittedText && !sawError && !cleanExit) return "The CLI exited with an error — is it installed and authenticated?";
+          if (!emittedText && !sawError && !cleanExit) {
+            const detail = stderrErrorSnippet ? ` (${stderrErrorSnippet})` : "";
+            return `The CLI exited with an error — is it installed and authenticated?${detail}`;
+          }
           if (!emittedText && !sawError) return "The CLI produced no output — is it installed and authenticated? (career-ops is best on Claude Code.)";
           return null;
         };
@@ -476,7 +562,7 @@ export async function POST(req: Request) {
           return close();
         }
 
-        const wroteReport = countReports() > reportsBefore;
+        const wroteReport = hasNewCompletedReport(reportsBefore, reportEntries());
         // Honesty gate (#9): a green "done" with a parsed score requires a CLEAN exit,
         // real output, AND (for evaluations) a report actually written. Anything else
         // is surfaced — an errored run must never be banked as a confident score.
@@ -489,8 +575,12 @@ export async function POST(req: Request) {
           send({ type: "error", msg: "This evaluation didn't save a report, so it's not in your tracker. Full evaluation is verified on Claude Code." });
         } else if (!cleanExit || sawError) {
           // Produced output (maybe even a report) but did NOT finish cleanly — flag it
-          // instead of recording a confident score off a half-finished run.
-          send({ type: "error", msg: "This run hit an error before finishing, so it isn't recorded as a confident result — re-run it to verify." });
+          // instead of recording a confident score off a half-finished run. sawError
+          // here means an authoritative structured error already sent its own
+          // message above; a bare non-clean exit gets the stderr snippet instead,
+          // when the heuristic classifier found one.
+          const detail = !sawError && stderrErrorSnippet ? ` (${stderrErrorSnippet})` : "";
+          send({ type: "error", msg: `This run hit an error before finishing, so it isn't recorded as a confident result — re-run it to verify.${detail}`.slice(0, 200) });
         } else {
           send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd });
           if (persists) {
@@ -515,6 +605,7 @@ export async function POST(req: Request) {
       // GET /api/jobs/{id}/events?from=N. The kill timer stays armed so a
       // genuinely stuck agent is still bounded.
       clientGone = true;
+      if (heartbeat) clearInterval(heartbeat);
       // The write token is deliberately NOT released here any more. It used to
       // be, because a disconnect ended the run — now the run outlives the
       // reader, and dropping the tracker-delete guard while the agent is still

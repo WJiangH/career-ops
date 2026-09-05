@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
 import { careerOpsRoot } from "@/lib/career-ops";
 import { DEFAULT_FILTERS, cleanChips, type ExploreFilters } from "@/lib/explore";
 import { profileTargetKeywords } from "@/lib/profile-keywords.mjs";
@@ -18,35 +18,20 @@ import { profileTargetKeywords } from "@/lib/profile-keywords.mjs";
  * Filter semantics mirror scan.mjs::buildTitleFilter / buildLocationFilter:
  *   title positive → substring match (empty = everything matches)
  *   title negative → substring reject
- *   location always_allow > block > allow (case-insensitive substring)
+ *   location block_hard > always_allow > block > allow (case-insensitive substring);
+ *   block_hard is the one tier always_allow cannot override (scan.mjs, #2956)
  */
-type FilterLists = Pick<ExploreFilters, "positive" | "negative" | "allow" | "block" | "alwaysAllow">;
+type FilterLists = Pick<ExploreFilters, "positive" | "negative" | "allow" | "block" | "alwaysAllow" | "blockHard">;
 
 function listFrom(v: unknown): string[] {
   return cleanChips(v);
 }
 
-/** Serialize filters into a minimal, valid portals.yml. Scalars go through
- *  JSON.stringify (a valid YAML double-quoted scalar) so arbitrary keywords —
- *  colons, quotes, leading dashes — can never break the document or inject YAML. */
-export function serializePortals(f: FilterLists): string {
-  const block = (key: string, items: string[]) =>
-    items.length ? `  ${key}:\n` + items.map((k) => `    - ${JSON.stringify(k)}`).join("\n") + "\n" : "";
-
-  let out = "# Ephemeral Explorer filters — generated per-search, safe to delete.\n";
-  if (f.positive.length || f.negative.length) {
-    out += "title_filter:\n";
-    out += block("positive", f.positive);
-    out += block("negative", f.negative);
-  }
-  if (f.allow.length || f.block.length || f.alwaysAllow.length) {
-    out += "location_filter:\n";
-    out += block("always_allow", f.alwaysAllow);
-    out += block("allow", f.allow);
-    out += block("block", f.block);
-  }
-  return out;
-}
+// serializePortals lives in portals-serialize.mjs (pure, no TS deps) so the web
+// `node --test` suite can load it — the block_hard round-trip (#3102) is exactly
+// a "don't silently drop a tier" property that has to be asserted, not eyeballed.
+export { serializePortals } from "./portals-serialize.mjs";
+import { serializePortals } from "./portals-serialize.mjs";
 
 /**
  * Exclusions the real portals.yml declares, always applied on top of the UI's.
@@ -113,7 +98,8 @@ export function seedExploreFilters(): { filters: ExploreFilters; seededFrom: str
     filters.allow = listFrom(lf.allow);
     filters.block = listFrom(lf.block);
     filters.alwaysAllow = listFrom(lf.always_allow);
-    if (filters.positive.length || filters.allow.length || filters.block.length) seededFrom.push("portals.yml");
+    filters.blockHard = listFrom(lf.block_hard);
+    if (filters.positive.length || filters.allow.length || filters.block.length || filters.blockHard.length) seededFrom.push("portals.yml");
   }
 
   if (filters.positive.length === 0) {

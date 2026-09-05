@@ -15,9 +15,11 @@ export function searchDirs() {
   const home = os.homedir();
   const extra = [
     path.join(home, ".local/bin"),
+    path.join(home, ".grok/bin"), // Grok Build CLI
     path.join(home, ".npm-global/bin"),
     path.join(home, ".bun/bin"),
     path.join(home, ".deno/bin"),
+    path.join(home, ".opencode/bin"),
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
@@ -29,6 +31,7 @@ export function searchDirs() {
     const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
     extra.push(
       path.join(localAppData, "agy", "bin"), // Antigravity CLI
+      path.join(localAppData, "grok", "bin"), // Grok Build CLI
       path.join(localAppData, "Microsoft", "WindowsApps"), // winget/Store shims
       path.join(appData, "npm"), // npm global prefix on Windows
     );

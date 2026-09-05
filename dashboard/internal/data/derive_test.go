@@ -291,6 +291,78 @@ func TestDeriveNoteFields(t *testing.T) {
 			paySrc:   "POSTED",
 			last:     "2026-06-04",
 		},
+		{
+			// The regression the segment anchor exists to prevent. With a
+			// word-boundary match this date was read as posting metadata AND
+			// stripped from the last-contact scan, so a recruiter interaction
+			// that really happened vanished and the row fell back to its applied
+			// date. Prose is not a segment: "posted" mid-sentence stays contact.
+			name: "prose \"posted\" is a real interaction, not posting metadata",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "Recruiter posted 2026-07-20 update on the req",
+			},
+			last: "2026-07-20",
+		},
+		{
+			name: "a posting segment is still read when the note leads with it",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "posted 2026-05-11 | Remote US",
+			},
+			workMode: "Remote",
+			last:     "2026-06-01",
+			postedOn: "2026-05-11",
+		},
+		{
+			// Edge 1 of the two the review asked to pin: the colon form with no
+			// space. It is unambiguously a segment, so it must populate PostedOn
+			// — and, having done so, must not also count as contact.
+			name: "posted:<date> with no space is a posting segment",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "Remote US; posted:2026-07-15",
+			},
+			workMode: "Remote",
+			last:     "2026-06-01",
+			postedOn: "2026-07-15",
+		},
+		{
+			// The bare form requires a space, so this sets no PostedOn. It is
+			// not contact either — reISODate needs a word boundary the welded
+			// "posted2026" does not give it — so the row keeps its applied date
+			// and the malformed token is inert on both paths.
+			name: "\"posted\" welded to the date is inert, not a segment",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "Remote US; posted2026-07-15",
+			},
+			workMode: "Remote",
+			last:     "2026-06-01",
+		},
+		{
+			// Edge 2: two posting dates in one note. A re-post replaces the req,
+			// so the column has to show the live one — the first match would pin
+			// the row to a requisition that no longer exists.
+			name: "with two posting dates the most recent one wins",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "posted: 2026-03-02 | reposted; posted: 2026-07-19",
+			},
+			last:     "2026-06-01",
+			postedOn: "2026-07-19",
+		},
+		{
+			name: "stripping a posting segment cannot weld its neighbours together",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "Austin, TX; posted: 2026-05-20; screen 2026-06-14",
+			},
+			location: "Austin, TX",
+			workMode: "Full",
+			last:     "2026-06-14",
+			postedOn: "2026-05-20",
+		},
 	}
 
 	for _, tc := range cases {

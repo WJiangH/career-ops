@@ -29,15 +29,17 @@
  */
 
 import { readFileSync, existsSync, readdirSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
-import yaml from 'js-yaml';
+import { join } from 'path';
+import { getCareerOpsRoot } from './path-resolver.mjs';
+import * as yaml from 'js-yaml';
 import { matchedTitleKeywords } from './scan.mjs';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
-const PORTALS = join(ROOT, 'portals.yml');
-const HISTORY = join(ROOT, 'data', 'scan-history.tsv');
-const REPORTS = join(ROOT, 'reports');
+// User-layer files (cv.md, portals.yml, data/, reports/) live under the data
+// root, which CAREER_OPS_ROOT may point away from the codebase.
+const USER_ROOT = getCareerOpsRoot();
+const PORTALS = join(USER_ROOT, 'portals.yml');
+const HISTORY = join(USER_ROOT, 'data', 'scan-history.tsv');
+const REPORTS = join(USER_ROOT, 'reports');
 
 /** scan-history.tsv rows. Positional by header — trailing columns are appended
  *  over time and older rows legitimately have fewer (see DATA_CONTRACT.md). */
