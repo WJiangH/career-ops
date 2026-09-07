@@ -1,4 +1,5 @@
 import { chromium, type Browser, type BrowserContext, type Page, type Frame, type Response } from "playwright-core";
+import { liveFrames, withTimeout, FRAME_CALL_MS } from "./frames.mjs";
 import { extractForm, type ApplyField, type ExtractedForm } from "./extract";
 import { parseGreenhouse, fetchGreenhouseSchema } from "./greenhouse";
 import { statusBlock, dismissConsent, tryApplyTrigger, dropNewTabs, classifyEmpty, captchaWarning, multiStepInfo, verifyFill, type ApplyIssue } from "./diagnose";
@@ -9,7 +10,7 @@ import { agentInterpretForm } from "./agent-interpret";
 async function richestControlFrame(page: Page): Promise<Frame> {
   let best = page.mainFrame();
   let bestN = -1;
-  for (const fr of page.frames()) {
+  for (const fr of liveFrames(page)) {
     const n = await fr.evaluate(() => document.querySelectorAll('input, textarea, select, [role="combobox"], [contenteditable="true"]').length).catch(() => 0);
     if (n > bestN) {
       bestN = n;
@@ -71,12 +72,12 @@ async function pickFormFrame(page: Page): Promise<{ frame: Frame; form: Extracte
     frame: page.mainFrame(),
     form: { title: "", url: page.url(), fields: [] },
   };
-  for (const fr of page.frames()) {
+  for (const fr of liveFrames(page)) {
     try {
-      const form = await extractForm(fr);
+      const form = await withTimeout(extractForm(fr), FRAME_CALL_MS, "extractForm");
       if (form.fields.length > best.form.fields.length) best = { frame: fr, form };
     } catch {
-      /* detached / cross-origin restriction → skip */
+      /* detached / cross-origin restriction / hung frame → skip */
     }
   }
   // Prefer the main frame's title (the posting title) when an iframe won the form.
@@ -209,7 +210,7 @@ export async function openSession(url: string, cliId?: string, forceAgent?: bool
   // 3) Wait for real form controls to render (SPA hydrate) in ANY frame (embedded
   //    forms), then settle. More reliable than a fixed sleep.
   const formSel = 'form input, form textarea, input[type=file], [role=combobox], [class*="application-form" i], #application_form';
-  await Promise.race(page.frames().map((f) => f.waitForSelector(formSel, { timeout: 12_000 }).catch(() => null))).catch(() => {});
+  await Promise.race(liveFrames(page).map((f: Frame) => f.waitForSelector(formSel, { timeout: 12_000 }).catch(() => null))).catch(() => {});
   await page.waitForTimeout(1200);
   await dropNewTabs(page); // make any "Apply" link/popup navigate in OUR tab
   await snap(); // settled
@@ -226,7 +227,7 @@ export async function openSession(url: string, cliId?: string, forceAgent?: bool
     ({ frame, form } = await pickFormFrame(page));
   }
   if (!noApplyBtn && !looksLikeApplicationForm(form) && (await tryApplyTrigger(page))) {
-    await Promise.race(page.frames().map((f) => f.waitForSelector(formSel, { timeout: 6_000 }).catch(() => null))).catch(() => {});
+    await Promise.race(liveFrames(page).map((f: Frame) => f.waitForSelector(formSel, { timeout: 6_000 }).catch(() => null))).catch(() => {});
     await page.waitForTimeout(800);
     await dropNewTabs(page);
     ({ frame, form } = await pickFormFrame(page));

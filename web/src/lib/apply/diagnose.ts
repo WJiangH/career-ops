@@ -1,4 +1,5 @@
 import type { Page, Frame } from "playwright-core";
+import { liveFrames } from "./frames.mjs";
 import type { ApplyField } from "./extract";
 import type { ApplyIssue } from "./issue";
 
@@ -67,7 +68,7 @@ export async function dismissConsent(page: Page): Promise<ApplyIssue[]> {
  *  opens a NEW tab we don't follow and the loop never reaches the form. We strip
  *  target=_blank in every frame so any click/navigation stays in OUR page. */
 export async function dropNewTabs(page: Page): Promise<void> {
-  for (const fr of page.frames()) {
+  for (const fr of liveFrames(page)) {
     await fr
       .evaluate(() => {
         document.querySelectorAll('a[target="_blank"], a[target="_new"], form[target]').forEach((el) => el.removeAttribute("target"));
