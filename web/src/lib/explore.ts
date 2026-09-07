@@ -19,6 +19,11 @@ export const ATS_LABEL: Record<AtsSource, string> = {
 export type ExploreFilters = {
   positive: string[];
   negative: string[];
+  /** AI-suggested keywords the user has NOT promoted yet (titles-suggest.mjs
+   *  `candidates`). Shown as a row of "+" chips under Roles to find; never sent
+   *  to the scanner and never written to portals.yml — only a promoted one
+   *  moves into `positive`. */
+  candidates: string[];
   allow: string[];
   block: string[];
   blockHard: string[];
@@ -31,6 +36,7 @@ export type ExploreFilters = {
 export const DEFAULT_FILTERS: ExploreFilters = {
   positive: [],
   negative: [],
+  candidates: [],
   allow: [],
   block: [],
   blockHard: [],
@@ -127,6 +133,7 @@ export function parseExplorePatch(
   const lists: [keyof ExploreFilters, string][] = [
     ["positive", "positive"],
     ["negative", "negative"],
+    ["candidates", "candidates"],
     ["allow", "allow"],
     ["block", "block"],
     ["blockHard", "blockHard"],
@@ -150,6 +157,7 @@ export function filtersToParams(f: ExploreFilters): string {
   const sp = new URLSearchParams();
   if (f.positive.length) sp.set("q", f.positive.join(","));
   if (f.negative.length) sp.set("not", f.negative.join(","));
+  if (f.candidates?.length) sp.set("cand", f.candidates.join(","));
   if (f.allow.length) sp.set("loc", f.allow.join(","));
   if (f.block.length) sp.set("noloc", f.block.join(","));
   if (f.blockHard.length) sp.set("hardno", f.blockHard.join(","));
@@ -166,6 +174,7 @@ export function paramsToFilters(sp: URLSearchParams, base: ExploreFilters = DEFA
     {
       positive: split(sp.get("q")),
       negative: split(sp.get("not")),
+      candidates: split(sp.get("cand")),
       allow: split(sp.get("loc")),
       block: split(sp.get("noloc")),
       blockHard: split(sp.get("hardno")),

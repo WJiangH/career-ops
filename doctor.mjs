@@ -456,7 +456,10 @@ const USER_LAYER_PREREQS = [
   {
     path: 'portals.yml',
     fix: [
-      'Run: cp templates/portals.example.yml portals.yml',
+      'Run: node titles-suggest.mjs --init',
+      '  (copies templates/portals.example.yml, then — if an agent CLI is installed — has it read',
+      '   cv.md and propose roles / candidates / excludes, each replayed against scan history;',
+      '   without an agent it keeps the template keywords)',
       'Then customize with your target companies',
     ],
   },

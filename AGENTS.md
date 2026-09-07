@@ -212,9 +212,14 @@ Fill in `config/profile.yml` (including `spend_tier`, default `standard`). Arche
 
 #### Step 3: Portals (recommended)
 If `portals.yml` is missing:
-> "I'll set up the job scanner with 45+ pre-configured companies. Want me to customize the search keywords for your target roles?"
+> "I'll set up the job scanner with 45+ pre-configured companies. Want me to derive the search keywords from your CV?"
 
-Copy `templates/portals.example.yml` → `portals.yml`; if they gave target roles in Step 2, update `title_filter.positive`.
+Run `node titles-suggest.mjs --init`. It copies `templates/portals.example.yml` → `portals.yml` (companies, boards, location and negative filters have no derivation path, so the template is the starting point), then:
+
+- **An agent CLI is installed** → the agent reads `cv.md` (only `cv.md` — see `modes/titles-suggest.md`) and proposes three buckets: `roles` to search for now, `candidates` the user may promote, `exclude` to keep the noise out. Every keyword is replayed against `data/scan-history.tsv` and `data/scan-rejects.tsv` with the scanner's own matcher, and the report shows the numbers. `roles` replace the template's `title_filter.positive`; `exclude` is appended to `title_filter.negative`.
+- **No CLI** → the template's keywords are kept unchanged (the original onboarding flow). If they gave target roles in Step 2, update `title_filter.positive` by hand as before. When an agent becomes available: `node titles-suggest.mjs --write`, or — inside an agent session — `node titles-suggest.mjs --prompt`, answer it, save the JSON, and `node titles-suggest.mjs --from <file> --write`.
+
+In the web app the same proposal fills **Roles to find** and a **Candidates** row (Explore → Suggest from CV); a candidate is promoted with its `+` and reaches `portals.yml` only through the existing confirm-gated portals writer. `modes/titles.md` remains the mode for widening an existing list, and `titles-derive.mjs` the deterministic audit of which current keywords `cv.md` supports. Nothing in `portals.yml` other than `title_filter.positive` / `title_filter.negative` is ever written by these tools.
 
 #### Step 4: Tracker
 If `data/applications.md` doesn't exist, create it:

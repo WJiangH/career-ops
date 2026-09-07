@@ -25,16 +25,35 @@
  * modes/titles.md's rule that portals.yml is never written without the user
  * seeing the exact diff first.
  *
+ * Day zero — `--init` — is the case doctor.mjs used to answer with
+ * `cp templates/portals.example.yml portals.yml`. It still starts there: the
+ * template is copied verbatim, because everything in it except
+ * `title_filter.positive` (companies, boards, location and negative filters)
+ * has no derivation path and is a better starting point than nothing. Then:
+ *
+ *   - an agent CLI is installed  → both layers run and the template's keywords
+ *     are REPLACED by the CV-derived set, with the same diff report --write
+ *     prints. There is no history to regress against yet, so no recall gate.
+ *   - no CLI (or --no-llm)       → the template's keywords are KEPT — the
+ *     original onboarding flow, unchanged — and the mechanical candidates are
+ *     printed as advice. Nothing mechanical-only is written: the user asked for
+ *     "the author's flow when there is no AI", and a half-derived list with no
+ *     synonyms and no drops is neither that nor a finished proposal.
+ *
  * Usage:
  *   node titles-derive.mjs                # mechanical + model if available
  *   node titles-derive.mjs --no-llm       # mechanical only
  *   node titles-derive.mjs --json
  *   node titles-derive.mjs --cli codex
+ *   node titles-derive.mjs --write        # replace title_filter.positive in portals.yml
+ *   node titles-derive.mjs --init         # day zero: no portals.yml yet (see above)
+ *   node titles-derive.mjs --help
  */
 
 import { readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import * as yaml from 'js-yaml';
 import {
   deriveKeywords, readCv, unsupportedByCv, redundancyGroups,
@@ -43,14 +62,38 @@ import {
 // The scanner's own matcher — a claim about what a keyword admits is checked
 // against the code that will actually run, never taken on assertion.
 import { buildTitleFilter } from './scan.mjs';
+import { validateFlags } from './lib/cli-flags.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
+import { replacePositiveBlock as replacePositiveBlockShared, scaffoldPortals, TEMPLATE_REL } from './lib/portals-blocks.mjs';
 
-const ROOT = process.cwd();
+// User-layer files (cv.md, portals.yml, modes/_profile.md, data/) resolve under
+// the data root; system-layer files (modes/titles-init.md, the template) ship
+// with the code. DATA_CONTRACT — CAREER_OPS_ROOT may separate the two.
+const CODE_ROOT = dirname(fileURLToPath(import.meta.url));
+const DATA_ROOT = getCareerOpsRoot();
 const argv = process.argv.slice(2);
+
+const USAGE = `Usage:
+  node titles-derive.mjs                # propose title_filter.positive from cv.md (mechanical + model if a CLI is installed)
+  node titles-derive.mjs --no-llm       # mechanical layer only
+  node titles-derive.mjs --json         # machine-readable proposal
+  node titles-derive.mjs --cli <name>   # force one agent CLI (claude, codex, grok, gemini)
+  node titles-derive.mjs --write        # replace title_filter.positive in an existing portals.yml
+  node titles-derive.mjs --force        # with --write: accept a >25% recall loss against scan-history
+  node titles-derive.mjs --init         # day zero: copy templates/portals.example.yml, then derive if a CLI is installed
+  node titles-derive.mjs --help`;
+
+const KNOWN_FLAGS = ['--json', '--no-llm', '--write', '--force', '--init', '--cli', '--help', '-h'];
+validateFlags(argv, KNOWN_FLAGS, USAGE, { valueFlags: ['--cli'], requireOperand: true });
+if (argv.includes('--help') || argv.includes('-h')) { console.log(USAGE); process.exit(0); }
+
 const JSON_OUT = argv.includes('--json');
 const NO_LLM = argv.includes('--no-llm');
 const WRITE = argv.includes('--write');
 const FORCE = argv.includes('--force');
+const INIT = argv.includes('--init');
 const CLI_ARG = argv.includes('--cli') ? argv[argv.indexOf('--cli') + 1] : null;
+if (INIT && WRITE) die('--init and --write are different situations: --init creates portals.yml, --write updates one that exists.');
 
 /** Headless invocations, mirroring web/src/lib/clis.ts. Order = detect order. */
 const CLIS = [
@@ -66,7 +109,11 @@ function die(msg) {
 }
 
 function read(rel) {
-  const p = join(ROOT, rel);
+  const p = join(DATA_ROOT, rel);
+  return existsSync(p) ? readFileSync(p, 'utf8') : null;
+}
+function readSystem(rel) {
+  const p = join(CODE_ROOT, rel);
   return existsSync(p) ? readFileSync(p, 'utf8') : null;
 }
 
@@ -90,6 +137,23 @@ if (!cv) {
   );
 }
 
+// ── day zero (--init) ────────────────────────────────────────────────────────
+//
+// The template is copied whole, not assembled: its companies, boards, location
+// and negative filters are the author's, but they are a working scanner, and
+// nothing in the repo can derive them from a CV. Only the keyword block has a
+// derivation path, and it is replaced further down — but only when a model ran.
+
+const TEMPLATE = TEMPLATE_REL;
+if (INIT) {
+  if (existsSync(join(DATA_ROOT, 'portals.yml'))) {
+    die('portals.yml already exists — --init is for a checkout that has none.\n' +
+        '  To re-derive the keywords of an existing file, run with --write instead.');
+  }
+  try { scaffoldPortals(DATA_ROOT, CODE_ROOT); } catch (e) { die(e.message); }
+  if (!JSON_OUT) console.error(`titles-derive: copied ${TEMPLATE} → portals.yml`);
+}
+
 const portalsRaw = read('portals.yml');
 const portals = portalsRaw ? yaml.load(portalsRaw) : null;
 const currentPositive = portals?.title_filter?.positive ?? [];
@@ -101,7 +165,7 @@ const sections = readCv(cv);
 // matches inside other words). Bias in this corpus is irrelevant to that
 // question — it changes which titles are present, not whether "system" contains
 // "stem" — so the filter's own scan history is a fine source.
-const corpusPath = join(ROOT, 'data', 'scan-history.tsv');
+const corpusPath = join(DATA_ROOT, 'data', 'scan-history.tsv');
 const corpus = existsSync(corpusPath)
   ? [...new Set(readFileSync(corpusPath, 'utf8').split('\n').slice(1).map((l) => l.split('\t')[3]).filter(Boolean))]
   : [];
@@ -147,7 +211,18 @@ const result = {
 
 const cli = NO_LLM ? null : pickCli();
 
-if (!NO_LLM && !cli) {
+if (INIT && (NO_LLM || !cli)) {
+  // The user's rule for day zero without a model: the author's original flow,
+  // which is the template as shipped. Said explicitly, because the alternative
+  // — a filter silently built from CV nouns with no synonyms and no drops —
+  // would look finished and recall a fraction of the market.
+  console.error(
+    'titles-derive: ' + (NO_LLM ? '--no-llm' : 'no agent CLI on PATH') + ' — keeping the template\'s keywords ' +
+    '(the original onboarding flow).\n' +
+    '  The CV-derived candidates below are advice only; nothing beyond the template copy was written.\n' +
+    '  When a CLI is available, `node titles-derive.mjs --write` replaces the keywords from cv.md.',
+  );
+} else if (!NO_LLM && !cli) {
   // Loud, not silent. A user who does not know this step was skipped will
   // assume the keyword list is complete when it is missing every synonym the CV
   // does not literally spell.
@@ -165,7 +240,7 @@ if (cli) {
   // arrangement as gemini-eval.mjs reading modes/oferta.md. A prompt in a mode
   // file is reviewable, diffable and editable by the user; a prompt in a
   // template literal is neither.
-  const mode = read('modes/titles-init.md');
+  const mode = readSystem('modes/titles-init.md');
   if (!mode) die('modes/titles-init.md not found — the model layer has no instructions. Re-run with --no-llm for the mechanical pass alone.');
   const profile = read('modes/_profile.md') ?? '';
 
@@ -327,7 +402,7 @@ result.residual_redundancy = redundancyGroups(resolved);
  * precisely that: 23 keywords that recalled 135 of 541.
  */
 function recallCheck(keywords) {
-  const p = join(ROOT, 'data', 'scan-history.tsv');
+  const p = join(DATA_ROOT, 'data', 'scan-history.tsv');
   if (!existsSync(p)) return null;
   const titles = readFileSync(p, 'utf8').split('\n').slice(1).map((l) => l.split('\t')[3]).filter(Boolean);
   if (!titles.length) return null;
@@ -340,9 +415,16 @@ function recallCheck(keywords) {
 
 result.recall = recallCheck(resolved);
 
+// --init writes only when a model ran: a template copy plus mechanical nouns is
+// not the "AI suggestions" the flag promises, and the template alone is the
+// documented fallback for that case.
+const INIT_WRITES = INIT && Boolean(result.model);
+if (INIT) result.init = { scaffolded_from: TEMPLATE, keywords_written: INIT_WRITES };
+
 // ── output ───────────────────────────────────────────────────────────────────
 
 if (JSON_OUT) {
+  if (WRITE || INIT_WRITES) applyWrite({ quiet: true });
   console.log(JSON.stringify(result, null, 2));
   process.exit(0);
 }
@@ -410,63 +492,26 @@ if (result.recall) {
   }
 }
 
-if (!WRITE) console.log('\nNothing written. portals.yml is unchanged. Re-run with --write to apply.');
+if (!WRITE && !INIT) console.log('\nNothing written. portals.yml is unchanged. Re-run with --write to apply.');
+if (INIT && !INIT_WRITES) console.log(`\nportals.yml created from ${TEMPLATE}; its title_filter.positive is the template's.`);
 
 // ── write ────────────────────────────────────────────────────────────────────
 
-/**
- * Replace ONLY `title_filter.positive` in portals.yml, textually.
- *
- * A yaml.load/yaml.dump round-trip would be shorter and would destroy every
- * comment in the file — including the ones recording WHY a keyword is there,
- * which is the part a user cannot reconstruct. portals.yml is a user-layer file
- * (DATA_CONTRACT); the rest of it, `tracked_companies` most of all, has no
- * derivation path anywhere in the repo and must come back byte-identical.
- *
- * Same contract as the web's api/portals/route.ts: replaces one block,
- * preserves the others.
- *
- * @param {string} src - current portals.yml text
- * @param {string[]} keywords
- * @returns {string}
- */
+/** Textual replacement of title_filter.positive — see lib/portals-blocks.mjs. */
 export function replacePositiveBlock(src, keywords) {
-  const lines = src.split(/\r?\n/);
-  const tf = lines.findIndex((l) => /^title_filter:\s*$/.test(l));
-  if (tf < 0) throw new Error('portals.yml has no top-level title_filter: block');
-
-  let start = -1;
-  for (let i = tf + 1; i < lines.length; i++) {
-    if (/^\S/.test(lines[i])) break;              // left title_filter entirely
-    if (/^\s+positive:\s*$/.test(lines[i])) { start = i; break; }
-  }
-  if (start < 0) throw new Error('portals.yml has no title_filter.positive: block');
-
-  // The block ends at the next line that is not a list item, a comment or blank
-  // at a deeper indent — i.e. the next sibling key such as `negative:`.
-  const indent = (lines[start].match(/^\s*/) ?? [''])[0].length;
-  let end = lines.length;
-  for (let i = start + 1; i < lines.length; i++) {
-    const l = lines[i];
-    if (!l.trim()) continue;
-    const ind = (l.match(/^\s*/) ?? [''])[0].length;
-    if (ind <= indent) { end = i; break; }
-  }
-
-  const pad = ' '.repeat(indent);
-  const body = [
-    `${pad}  # Derived from cv.md by titles-derive.mjs. Re-run it after a CV change;`,
-    `${pad}  # hand edits here are kept until the next run proposes a diff over them.`,
-    ...keywords.map((k) => `${pad}  - ${JSON.stringify(k)}`),
-  ];
-  return [...lines.slice(0, start + 1), ...body, ...lines.slice(end)].join('\n');
+  return replacePositiveBlockShared(src, keywords);
 }
 
-if (WRITE) {
-  if (!portalsRaw) die('portals.yml not found — nothing to update. Scaffold it first (node doctor.mjs).');
+if (WRITE || INIT_WRITES) applyWrite({ quiet: false });
+
+function applyWrite({ quiet }) {
+  if (!portalsRaw) die('portals.yml not found — nothing to update. Scaffold it first (node titles-derive.mjs --init).');
   if (!resolved.length) die('the derivation produced no keywords — refusing to write an empty filter, which matches every posting.');
   const r = result.recall;
-  if (!FORCE && r && r.before > 0 && r.lost.length / r.before > 0.25) {
+  // The recall gate compares against what the CURRENT keywords admitted. On
+  // --init the current keywords are the template's, and losing what a
+  // stranger's filter caught is the point, not a regression.
+  if (WRITE && !FORCE && r && r.before > 0 && r.lost.length / r.before > 0.25) {
     die(
       `refusing to write: this proposal loses ${r.lost.length} of ${r.before} postings the current filter catches ` +
       `(${Math.round((100 * r.lost.length) / r.before)}%).\n` +
@@ -475,6 +520,6 @@ if (WRITE) {
     );
   }
   const next = replacePositiveBlock(portalsRaw, resolved);
-  writeFileSync(join(ROOT, 'portals.yml'), next, 'utf8');
-  console.log(`\nWrote ${resolved.length} keywords to portals.yml title_filter.positive. Everything else is unchanged.`);
+  writeFileSync(join(DATA_ROOT, 'portals.yml'), next, 'utf8');
+  if (!quiet) console.log(`\nWrote ${resolved.length} keywords to portals.yml title_filter.positive. Everything else is ${INIT ? 'the template' : 'unchanged'}.`);
 }

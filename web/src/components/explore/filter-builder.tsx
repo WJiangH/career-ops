@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { X, Ban, Clock, MapPin, ChevronDown, SlidersHorizontal } from "lucide-react";
+import { X, Ban, Clock, MapPin, ChevronDown, SlidersHorizontal, Plus, Sparkles, Loader2 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { ATS_LABEL, ATS_SOURCES, cleanChips, type AtsSource, type ExploreFilters } from "@/lib/explore";
 
@@ -17,6 +17,8 @@ const STYLE = `
 .co-fb__chip{display:inline-flex;align-items:center;gap:.3rem;border-radius:999px;padding:.2rem .5rem .2rem .6rem;font-size:12.5px;line-height:1.2;border:1px solid transparent}
 .co-fb__chip button{display:inline-flex;opacity:.6;transition:opacity .15s}
 .co-fb__chip button:hover{opacity:1}
+.co-fb__chip.cand{color:var(--co-muted,hsl(0 0% 40%));background:transparent;border-color:hsl(0 0% 50% / .35);border-style:dashed}
+.co-fb__chip.cand button.promote{opacity:.85}
 .co-fb__chip.inc{color:hsl(26 78% 42%);background:hsl(26 73% 51% / .11);border-color:hsl(26 73% 51% / .26)}
 html.dark .co-fb__chip.inc{color:hsl(26 86% 70%);background:hsl(26 80% 55% / .14);border-color:hsl(26 80% 55% / .28)}
 .co-fb__field{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;min-height:2.6rem;padding:.45rem .55rem;border-radius:.7rem}
@@ -98,17 +100,98 @@ function Label({ children, hint }: { children: React.ReactNode; hint?: string })
   );
 }
 
+type SuggestBucket = { keyword: string; why: string; hits?: number; unique?: number; rejectedHits?: number; vetoes?: number };
+type SuggestResult = { source: string | null; persona: string; roles: SuggestBucket[]; candidates: SuggestBucket[]; exclude: SuggestBucket[]; demoted: string[] };
+
+/** Candidate keywords: AI-suggested, not yet searched for. "+" promotes one into
+ *  Roles to find; "×" dismisses it. The hover text carries the model's one-line
+ *  reason and the replay numbers, so promoting is a decision with evidence. */
+function CandidateRow({
+  values,
+  reasons,
+  onPromote,
+  onDismiss,
+}: {
+  values: string[];
+  reasons: Map<string, string>;
+  onPromote: (k: string) => void;
+  onDismiss: (k: string) => void;
+}) {
+  return (
+    <div className={cn("co-fb__field border border-dashed border-border/70 bg-transparent")}>
+      {values.map((v) => (
+        <span key={v} className="co-fb__chip cand" title={reasons.get(v) ?? "AI-suggested; not searched for until promoted"}>
+          {v}
+          <button type="button" className="promote" aria-label={`Add ${v} to roles`} onClick={() => onPromote(v)}>
+            <Plus className="size-3" />
+          </button>
+          <button type="button" aria-label={`Dismiss ${v}`} onClick={() => onDismiss(v)}>
+            <X className="size-3" />
+          </button>
+        </span>
+      ))}
+      {values.length === 0 && <span className="text-[12px] text-faint">none yet — Suggest from CV fills this row</span>}
+    </div>
+  );
+}
+
 export function FilterBuilder({
   filters,
   onChange,
   seededFrom = [],
+  cliId = null,
 }: {
   filters: ExploreFilters;
   onChange: (f: ExploreFilters) => void;
   seededFrom?: string[];
+  /** the user's configured agent CLI (localStorage career-ops:config.cliId); null = none */
+  cliId?: string | null;
 }) {
   const [advanced, setAdvanced] = useState(false);
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestNote, setSuggestNote] = useState<string | null>(null);
+  const [reasons, setReasons] = useState<Map<string, string>>(new Map());
   const set = (patch: Partial<ExploreFilters>) => onChange({ ...filters, ...patch });
+  const candidates = filters.candidates ?? [];
+
+  const promote = (k: string) =>
+    onChange({ ...filters, positive: cleanChips([...filters.positive, k]), candidates: candidates.filter((c) => c !== k) });
+  const dismiss = (k: string) => set({ candidates: candidates.filter((c) => c !== k) });
+
+  const describe = (b: SuggestBucket) => {
+    const n: string[] = [];
+    if (typeof b.hits === "number") n.push(`${b.hits} seen title${b.hits === 1 ? "" : "s"}`);
+    if (typeof b.rejectedHits === "number" && b.rejectedHits > 0) n.push(`${b.rejectedHits} previously rejected`);
+    return [b.why, n.join(" · ")].filter(Boolean).join(" — ");
+  };
+
+  const suggest = async () => {
+    setSuggesting(true);
+    setSuggestNote(null);
+    try {
+      const r = await fetch("/api/explore/suggest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cliId }) });
+      const j = (await r.json()) as SuggestResult & { error?: string };
+      if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+      const next = new Map<string, string>();
+      for (const b of [...j.roles, ...j.candidates]) next.set(b.keyword, describe(b));
+      setReasons(next);
+      const roles = cleanChips(j.roles.map((b) => b.keyword));
+      const cands = cleanChips(j.candidates.map((b) => b.keyword)).filter((k) => !roles.includes(k));
+      // Roles replace (this is an explicit "from my CV" action); excludes merge —
+      // a negative the user already typed is never dropped by a suggestion.
+      onChange({
+        ...filters,
+        positive: roles,
+        candidates: cands,
+        negative: cleanChips([...filters.negative, ...j.exclude.map((b) => b.keyword)]),
+      });
+      setSuggestNote(`${j.source ? `${j.source}: ` : ""}${roles.length} roles, ${cands.length} candidates, ${j.exclude.length} excludes. ${j.persona}`);
+    } catch (e) {
+      setSuggestNote(e instanceof Error ? e.message : "suggestion failed");
+    } finally {
+      setSuggesting(false);
+    }
+  };
   const toggleAts = (a: AtsSource) => {
     const has = filters.ats.includes(a);
     const next = has ? filters.ats.filter((x) => x !== a) : [...filters.ats, a];
@@ -120,11 +203,31 @@ export function FilterBuilder({
       <style>{STYLE}</style>
 
       <div>
-        <Label hint={filters.positive.length === 0 ? "empty = every fresh posting" : undefined}>Roles to find</Label>
+        <div className="mb-1.5 flex items-baseline justify-between">
+          <span className="text-[13px] font-medium text-foreground">Roles to find</span>
+          <span className="flex items-center gap-3">
+            {filters.positive.length === 0 && <span className="text-[11px] text-faint">empty = every fresh posting</span>}
+            <button
+              type="button"
+              onClick={() => void suggest()}
+              disabled={suggesting || !cliId}
+              title={cliId ? "Ask your agent CLI to read cv.md and propose roles, candidates and excludes" : "Configure an agent CLI in Config to enable suggestions"}
+              className="inline-flex items-center gap-1 text-[11px] font-medium text-brand disabled:opacity-40"
+            >
+              {suggesting ? <Loader2 className="size-3 animate-spin" /> : <Sparkles className="size-3" />} Suggest from CV
+            </button>
+          </span>
+        </div>
         <KeywordField values={filters.positive} tone="inc" placeholder="AI platform, ML infrastructure, staff engineer…" onChange={(v) => set({ positive: v })} />
-        {seededFrom.length > 0 && filters.positive.length > 0 && (
+        {seededFrom.length > 0 && filters.positive.length > 0 && !suggestNote && (
           <p className="mt-1 text-[11px] text-faint">Seeded from your {seededFrom.join(" + ")} — edit freely.</p>
         )}
+        {suggestNote && <p className="mt-1 text-[11px] text-faint">{suggestNote}</p>}
+      </div>
+
+      <div>
+        <Label hint="AI-suggested, weaker matches — + adds one to Roles to find">Candidates</Label>
+        <CandidateRow values={candidates} reasons={reasons} onPromote={promote} onDismiss={dismiss} />
       </div>
 
       <div>
