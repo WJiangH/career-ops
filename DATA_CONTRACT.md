@@ -30,6 +30,7 @@ These files contain your personal data, customizations, and work product. Update
 | `plugins.local/` | Your own / private plugins (never auto-updated) |
 | `plugins.lock` | Integrity pins + recorded consent for your enabled plugins (generated; never auto-updated) |
 | `data/applications.md` | Your application tracker (source of truth) |
+| `data/answer-bank.json` | Your standing answers to recurring application questions (work authorization, sponsorship, start date, relocation, salary floor, per-company "interviewed before"…) — asked once, reused by `apply` and the web prefill through `answer-bank.mjs`; facts only, consents flagged `confirm_each_time`; `node answer-bank.mjs seed` derives the profile-backed entries |
 | `data/applications.db` | Derived query index over `applications.md` (SQLite, rebuilt by `node tracker.mjs sync` — safe to delete) |
 | `data/pipeline.md` | Your URL inbox |
 | `data/scan-history.tsv` | Your scan history (tab-separated, append-only trailing columns; col 8: local SimHash JD fingerprint for cross-listing detection, col 9: posting date, cols 10-11: trust score/flags, col 12: normalized company key for repost/name matching). Older rows may have fewer columns — readers index by position and tolerate the absence. |

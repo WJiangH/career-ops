@@ -6,6 +6,7 @@ import { getSession } from "@/lib/apply/session";
 import { buildAnswerPrompt } from "@/lib/apply/answer-prompt.mjs";
 import { runPlanner } from "@/lib/apply/planner";
 import { extractJsonObject } from "@/lib/extract-json-object.mjs";
+import { matchAnswerBank, bankMemoryBlock, overlayBank, companyFromTitle } from "@/lib/apply/answer-bank";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -68,10 +69,15 @@ export async function POST(req: Request) {
       if (!resolved) return fail(`CLI '${cliId}' not found on this machine`);
       const { spec, binPath } = resolved;
 
-      const mem = readMemory().trim();
+      // Standing answers first: the bank is the candidate's own word for the
+      // screening questions the planner is told never to invent.
+      const bank = matchAnswerBank(s.fields, companyFromTitle(s.title));
+      const bankBlock = bankMemoryBlock(bank);
+      const mem = [readMemory().trim(), bankBlock].filter(Boolean).join("\n\n");
       const prompt = buildAnswerPrompt({ title: s.title, fields: s.fields, memory: mem });
 
       log(`Form: "${s.title}" · ${s.fields.length} fields · prompt ${prompt.length} chars · memory ${mem.length} chars`);
+      log(`Answer bank: ${bank.auto.length} auto · ${bank.confirm.length} to confirm · ${bank.unknown.length} unknown`);
       log(`Planner: ${cliId} (${binPath})`);
 
       const result = await runPlanner({
@@ -102,7 +108,9 @@ export async function POST(req: Request) {
       }
       const count = Object.keys(obj).length;
       log(`Parsed ${count} answers${truncated ? " (RECOVERED from truncated output — some fields may be missing)" : ""}`);
-      emit({ t: "done", answers: obj, truncated, count });
+      const applied = overlayBank(obj as Record<string, { value?: string; needs_confirmation?: boolean }>, bank);
+      if (applied.auto || applied.confirm) log(`Answer bank applied: ${applied.auto} filled verbatim · ${applied.confirm} shown for confirmation`);
+      emit({ t: "done", answers: obj, truncated, count: Object.keys(obj).length, bank: { auto: applied.auto, confirm: applied.confirm, unknown: bank.unknown.map((u) => u.label) } });
       controller.close();
     },
   });

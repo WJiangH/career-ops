@@ -107,6 +107,7 @@ AI-powered, CLI-agnostic job search automation: pipeline tracking, offer evaluat
 | `data/scan-runs.tsv` | Per-run scan counters (appended by `scan.mjs`, read by `stats.mjs`) |
 | `data/follow-ups.md` | Follow-up history tracker |
 | `data/blacklist.md` | Do-not-apply companies (user layer, opt-in, never auto-populated; respected by `scan.mjs` and the `auto-pipeline`/`oferta`/`apply` gates) |
+| `data/answer-bank.json` / `answer-bank.mjs` | Standing answers to recurring application questions, asked once and reused across forms (`match` for a whole form, `add` to record the candidate's answer, `seed` from `config/profile.yml`) — read by `apply` Step 5e and the web prefill; facts only, consents flagged `confirm_each_time` |
 | `data/salary-observations.tsv` | Append-only salary observation log (user layer) |
 | `data/assessments.tsv` | Append-only skills-assessment log (user layer, created on first `add`) |
 | `portals.yml` | Query and company config |

@@ -94,6 +94,24 @@ If a question matches, warn the candidate BEFORE generating or filling an answer
 - **Phrasing discipline:** describe the form question and what the jurisdiction's law prohibits — never assert that the employer is breaking the law or committing a violation; statutory hooks and exemptions are not verifiable from the form.
 - This step adds a warning before the answer is drafted; it changes nothing about the existing prepare-don't-submit flow, the Step 6 `needs_candidate_confirmation` contract, or the Step 5b knock-out handling (which is where lawful sponsorship questions are checked against the candidate's own profile — a different job than this step's).
 
+## Step 5e — Answer bank: ask once, answer everywhere
+
+Screening questions repeat across every ATS in slightly different words — "Do you have the right to work in the country you are applying to?", "Are you legally authorized to work in the United States?", "Will you now or in the future require sponsorship?", "When could you start?", "Have you interviewed with us before?". They are the candidate's facts, not the CV's, so Step 6 rightly refuses to invent them — but without memory that means asking the candidate the same question on every form.
+
+`data/answer-bank.json` (user layer, `answer-bank.mjs`) is that memory. Before drafting:
+
+1. Write the visible fields to a temp file as `[{id, label, options?}]` and run `node answer-bank.mjs match --file <tmp> --company "<visible company>"`. It returns three buckets:
+   - `auto` — a standing answer with a confident match (`level: auto`, `status: answered`, not `confirm_each_time`). **Use it verbatim.** Do not re-derive it from the CV, do not soften it.
+   - `confirm` — a match that must still be shown: `confirm_each_time` entries (relocation, salary, legal consents), weak matches (`level: suggest`), or a `needs-user` entry recorded earlier but never answered. Present the stored answer as the default and ask.
+   - `unknown` — no entry. Screening-family questions here (work authorization, sponsorship, relocation, start date, salary, interviewed-before, pronunciation, address, clearance) are the ones to ask the candidate **once**, in Step 5b's knock-out flow; free-text questions (why this company, describe a project) are drafted normally and never banked.
+2. When the candidate answers a screening question, record it immediately, in their words:
+   `node answer-bank.mjs add --question "<exact form label>" --answer "<their answer>" [--alias "<other phrasing seen>"] [--scope company:<Company>] [--confirm-each-time]`
+   Use `--scope company:<Company>` for facts that are true only for one employer ("Have you interviewed at Anthropic before?"). Use `--confirm-each-time` for anything the candidate wants to see every time even though the default is stable.
+3. Consents are never auto-filled from the bank. An arbitration agreement or AI-usage policy may be recorded with `--confirm-each-time` so the candidate's standing preference is shown, but the box is theirs to tick.
+4. `node answer-bank.mjs seed` derives the profile-backed entries (sponsorship need, notice period, hybrid/on-site preference, LinkedIn, publications, GitHub, salary floor) from `config/profile.yml`; re-run it after editing the profile. Seeded entries name their source key so the candidate can see why the answer is what it is.
+
+The bank holds facts about the candidate, never content generated for an employer, and it is never a source for Block B or any CV claim.
+
 ## Step 5c — Jurisdiction-prohibited content check (#2018)
 
 Application forms are where legally prohibited questions most often live — salary-history questions in particular appear in forms far more often than in JD text. While scanning the form (this can run in the same pass as Step 5b):
@@ -218,7 +236,7 @@ Notes:
 
 ## Step 8 — Persist application snapshot
 
-After the final answers are filled into the form or handed to the candidate for copy-paste, update the matched report with an additive `## Application Answers` section. If the candidate later confirms submission, update that same section from `filled` to `submitted`.
+After the final answers are filled into the form or handed to the candidate for copy-paste, update the matched report with an additive `## Application Answers` section. In the same pass, bank every screening answer the candidate confirmed or corrected during this form (`node answer-bank.mjs add …`, Step 5e) so the next form does not ask again; free-text answers stay in the report only. If the candidate later confirms submission, update that same section from `filled` to `submitted`.
 
 The section must include:
 - `**Date:** YYYY-MM-DD`
