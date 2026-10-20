@@ -19,8 +19,49 @@ import { claudeUsageTokens } from "./claude-usage.mjs";
  * distinguishable from the number alone, and guessing wrong is silent: summing
  * totals over-counts, and overwriting deltas under-counts. Absent means delta,
  * which is what Codex and Claude send.
- * @typedef {{status?: string, tool?: string, text?: string, tokens?: number, tokensAreTotal?: boolean, costUsd?: number | null, error?: string}} ParsedEvent
+ * `toolDetail` is the tool's argument (the command run, the query searched),
+ * shortened to one line, for CLIs whose tool-start event carries it. Claude's
+ * does not: its input is still `{}` at content_block_start.
+ * @typedef {{status?: string, tool?: string, toolDetail?: string, text?: string, tokens?: number, tokensAreTotal?: boolean, costUsd?: number | null, error?: string}} ParsedEvent
  */
+
+/** Argument keys worth showing, most specific first; anything else shows no detail. */
+const TOOL_DETAIL_KEYS = ["file_path", "path", "command", "pattern", "query", "url", "prompt"];
+
+/**
+ * One line naming what a tool call acted on, or "" when nothing recognisable.
+ * Codex wraps every command in a login shell; the wrapper is noise on every
+ * line, so only the command inside it is kept. Absolute paths keep their last
+ * two segments, which carry the meaning (modes/oferta.md, not the home-directory prefix).
+ * @param {unknown} input
+ * @param {number} [max]
+ * @returns {string}
+ */
+export function describeToolInput(input, max = 72) {
+  const obj = typeof input === "string" ? { command: input } : input;
+  if (!obj || typeof obj !== "object") return "";
+  for (const key of TOOL_DETAIL_KEYS) {
+    let raw = /** @type {Record<string, unknown>} */ (obj)[key];
+    if (Array.isArray(raw)) raw = raw.filter((x) => typeof x === "string").join(" ");
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    let v = raw.trim();
+    const shell = v.match(/^(?:\/bin\/)?(?:ba|z)?sh\s+-l?c\s+(['"])([\s\S]*)\1$/);
+    if (shell) v = shell[2];
+    v = v.replace(/\s+/g, " ");
+    if (v.startsWith("/") && !v.includes(" ")) {
+      const parts = v.split("/").filter(Boolean);
+      if (parts.length > 2) v = parts.slice(-2).join("/");
+    }
+    return v.length > max ? `${v.slice(0, max - 1)}…` : v;
+  }
+  return "";
+}
+
+/** @param {string} tool @param {unknown} input @returns {ParsedEvent} */
+function toolEvent(tool, input) {
+  const toolDetail = describeToolInput(input);
+  return toolDetail ? { tool, toolDetail } : { tool };
+}
 
 const STATUS_READY = "Agent ready";
 const STATUS_RECONNECTING = "Reconnecting…";
@@ -190,9 +231,9 @@ export function parseCodexEvent(line) {
 
   if (event.type === "item.started") {
     const type = event.item?.type;
-    if (type === "command_execution") return { tool: "Bash" };
-    if (type === "web_search") return { tool: "WebSearch" };
-    if (type === "mcp_tool_call") return { tool: event.item?.tool || "Working" };
+    if (type === "command_execution") return toolEvent("Bash", event.item);
+    if (type === "web_search") return toolEvent("WebSearch", event.item);
+    if (type === "mcp_tool_call") return toolEvent(event.item?.tool || "Working", event.item?.arguments);
   }
 
   if (event.type === "item.completed" && event.item?.type === "agent_message") {
@@ -340,7 +381,9 @@ export function parseGrokEvent(line) {
 
   if (ev.type === "tool_call") {
     const name = ev.toolName ?? ev.title;
-    return { tool: typeof name === "string" && name ? name : "Working" };
+    // Grok labels its search tool "Web search:", trailing colon and all.
+    const tool = typeof name === "string" && name.replace(/[:\s]+$/, "") ? name.replace(/[:\s]+$/, "") : "Working";
+    return toolEvent(tool, ev.rawInput);
   }
 
   if (ev.type === "usage" || ev.type === "end") {

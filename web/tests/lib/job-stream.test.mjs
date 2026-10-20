@@ -122,3 +122,24 @@ test("confirmed success does not wait on or fail with the transport after done",
   assert.deepEqual(result, { status: "done", tokens: 42 });
   assert.equal(cancelled, 1);
 });
+
+test("onRecord counts transcript records, terminal included, and never a keepalive", async () => {
+  const fixture = response([
+    record({ type: "status", label: "Agent ready" }),
+    record({ type: "keepalive" }),
+    record({ type: "tool", name: "Read", detail: "cv.md" }) + record({ type: "keepalive" }),
+    record({ type: "done", tokens: 1 }),
+  ]);
+  const records = [];
+  const result = await readJobStream(fixture.stream, () => {}, (r) => records.push(r.type));
+  assert.deepEqual(result, { status: "done", tokens: 1 });
+  assert.deepEqual(records, ["status", "tool", "done"]);
+});
+
+test("a stream cut off mid-run reports no terminal record, so the client can tell it from a failed run", async () => {
+  const fixture = response([record({ type: "text", text: "working" })], { error: new TypeError("network failed") });
+  const records = [];
+  const result = await readJobStream(fixture.stream, () => {}, (r) => records.push(r.type));
+  assert.equal(result.status, "error");
+  assert.deepEqual(records, ["text"]);
+});

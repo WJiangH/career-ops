@@ -24,13 +24,16 @@ import { resolveCvTemplate } from "@/lib/core/cv-template.mjs";
 import { acquireTrackerWrite, releaseTrackerWrite } from "@/lib/core/run-registry";
 import { createRunFinalizer } from "@/lib/run-finalizer.mjs";
 import { readJsonObject } from "@/lib/json-body";
+import { createRunChannel, runJobId } from "@/lib/run-channel.mjs";
+import { appendEvent, createJob, finishJob } from "@/lib/core/job-log";
+import { parseMachineSummary } from "@/lib/run-summary.mjs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 800; // a real oferta evaluation / pdf-mode CV tailoring + render is heavy and multi-step
 
 export async function POST(req: Request) {
-  const body = await readJsonObject<{ kind?: string; input?: string; cliId?: string; brief?: unknown; model?: string; effort?: string }>(req);
+  const body = await readJsonObject<{ kind?: string; input?: string; cliId?: string; brief?: unknown; model?: string; effort?: string; jobId?: string; title?: string }>(req);
   if (!body) return new Response(JSON.stringify({ error: "bad json" }), { status: 400 });
   const { kind = "evaluate", input, cliId: requestedCliId, brief, model, effort } = body;
   if (!input || !requestedCliId) {
@@ -234,23 +237,42 @@ export async function POST(req: Request) {
   child.stderr.setEncoding("utf8");
   const enc = new TextEncoder();
 
+  // The run belongs to the server, not to the request that started it. The
+  // transcript goes to the job log (lib/core/job-log), and a client that loses
+  // the stream (a locked phone, a backgrounded PWA, a closed tab) picks it back
+  // up from GET /api/jobs/{id}/events?from=N. The client sends the id it will
+  // resubscribe with; a missing or malformed one gets a fresh id instead.
+  const jobId = runJobId(body.jobId);
+  try {
+    createJob({ id: jobId, kind, input, title: (typeof body.title === "string" && body.title.trim() ? body.title.trim() : `${kind} · ${input}`).slice(0, 200) });
+  } catch {
+    /* best-effort: an unwritable log costs the replay, never the run */
+  }
+
   // Stream-lifetime state lives outside start() so cancel() (client disconnect)
-  // can stop every timer before the child's late handlers run. send() is also
-  // try/catch'd so a late enqueue cannot throw uncaught (see #1155).
-  let closed = false;
+  // can stop the heartbeat before the child's late handlers run.
   let killer: ReturnType<typeof setTimeout> | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
-  // pdf render and evaluate persist keep running after the agent child closes.
-  // cancel() must not release the tracker guard until that work settles.
-  let pdfRenderPromise: Promise<void> | null = null;
-  let evaluatePersistPromise: Promise<void> | null = null;
-  // Cancellation only requests termination. Keep the guard until the child
-  // actually closes and any render or persist work has finished.
+  let channel: ReturnType<typeof createRunChannel> | undefined;
+  // The guard is released once the child has closed AND the run has finalized,
+  // which includes any pdf render or evaluate persist that runs after the
+  // child. A client disconnect is neither, so it never releases the guard.
   const finishRun = createRunFinalizer(child, () => {
     if (writeToken !== null) releaseTrackerWrite(writeToken);
   });
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
+      // Two states, not one `closed` flag: channel.attached (someone is reading
+      // the stream) and channel.finalized (the run is over). Losing the reader
+      // only stops enqueuing; the child, the transcript and the honesty gates
+      // below keep running, and the kill timer still bounds a stuck agent.
+      const ch = createRunChannel({
+        enqueue: (line: string) => controller.enqueue(enc.encode(line)),
+        closeStream: () => controller.close(),
+        log: { append: (event: unknown) => appendEvent(jobId, event), finish: (record) => finishJob(jobId, record) },
+        onDetach: () => { if (heartbeat) clearInterval(heartbeat); },
+      });
+      channel = ch;
       let buf = "";
       let emittedText = false; // any assistant text delta → the CLI actually ran
       // Set ONLY by an authoritative structured-stream signal (the ev.error branch
@@ -303,19 +325,10 @@ export async function POST(req: Request) {
         killedByTimeout = true;
         try { child.kill("SIGTERM"); } catch { /* ignore */ }
       }, killMs);
-      const send = (obj: unknown) => {
-        if (closed) return;
-        try {
-          controller.enqueue(enc.encode(JSON.stringify(obj) + "\n"));
-        } catch {
-          // The client is gone. Stop the heartbeat here rather than waiting for
-          // close(): the child can still run for minutes (maxDuration 800s), and
-          // a user retrying a failed run would otherwise accumulate one live
-          // timer per abandoned request.
-          closed = true;
-          if (heartbeat) clearInterval(heartbeat);
-        }
-      };
+      // Logged first, then streamed while a reader is attached. An enqueue that
+      // throws detaches the reader (and stops the heartbeat, see onDetach) but
+      // never throws out of here (see #1155).
+      const send = (obj: unknown) => ch.send(obj);
       // Say so when the chosen runtime has no permission mechanism we can apply.
       // Claude gets tool allow/deny lists and Codex an OS sandbox; the rest run
       // with whatever they grant by default. Without this the two cases are
@@ -338,16 +351,17 @@ export async function POST(req: Request) {
       // It must be a timer, not a hook on incoming text: piggy-backing on agent
       // output cannot fire during exactly the silences it needs to cover.
       // Unknown event types are ignored by the client's switch, so old tabs are safe.
-      heartbeat = setInterval(() => send({ type: "keepalive" }), 10_000);
+      // ch.keepalive, not send: a keepalive is transport, not transcript, and
+      // one in the job log every 10s would bury what a reconnecting client replays.
+      heartbeat = setInterval(() => ch.keepalive(), 10_000);
+      // Ends the run: records it in the job log (status from the terminal event
+      // already sent), closes the stream if anyone still reads it, and lets the
+      // finalizer release the tracker guard once the child has closed too.
       const close = () => {
-        // Resource cleanup is independent of whether the client can still read.
+        if (heartbeat) clearInterval(heartbeat);
+        if (killer) clearTimeout(killer);
+        ch.finalize({ tokens: lastTokens, costUsd: lastCostUsd });
         finishRun();
-        if (!closed) {
-          closed = true;
-          if (heartbeat) clearInterval(heartbeat);
-          if (killer) clearTimeout(killer);
-          try { controller.close(); } catch { /* */ }
-        }
       };
       // pdf's CV arrives inline in a <<cv-html>> envelope (#2185); evaluate's
       // report arrives in a <<report-md>> envelope. The filter keeps every byte
@@ -396,7 +410,7 @@ export async function POST(req: Request) {
           // backend has nothing to save and the 25 KB body floods the run log (#2185).
           sendAgentText(text);
         }
-        if (ev?.tool) send({ type: "tool", name: ev.tool });
+        if (ev?.tool) send(ev.toolDetail ? { type: "tool", name: ev.tool, detail: ev.toolDetail } : { type: "tool", name: ev.tool });
         if (ev?.status) send({ type: "status", label: ev.status });
         // Accumulated, not assigned: usage events are per-turn, so overwriting made a
         // multi-turn run report only its last turn. The authoritative "done" is sent
@@ -410,7 +424,10 @@ export async function POST(req: Request) {
       };
 
       child.stdout.on("data", (chunk: string) => {
-        if (closed) return;
+        // Gated on the run being over, NOT on a reader being attached:
+        // emittedText/sawError feed the honesty gates in child.on("close"), so
+        // skipping the parse after a disconnect would fail a completed run.
+        if (ch.finalized) return;
         if (!spec.parseEvent) {
           emittedText = true;
           sendAgentText(chunk);
@@ -465,11 +482,11 @@ export async function POST(req: Request) {
           }
           sendWarnings(result.warnings);
           const reportN = Number(result.num);
-          if (Number.isFinite(reportN)) {
-            send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd, reportN });
-          } else {
-            send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd });
-          }
+          // The report's own Machine Summary, so a client that was away for the
+          // whole run gets the verdict from the transcript or /api/jobs alone.
+          const summary = parseMachineSummary(markdown);
+          const tldr = summary ? { ...summary, report: `reports/${result.reportFile}` } : undefined;
+          send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd, ...(Number.isFinite(reportN) ? { reportN } : {}), ...(tldr ? { tldr } : {}) });
         } catch (e) {
           send({ type: "error", msg: `Evaluation persist crashed unexpectedly: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200) });
         } finally {
@@ -511,10 +528,10 @@ export async function POST(req: Request) {
       child.on("close", (code) => {
         // A trailing line with no newline would otherwise never be tested.
         if (stderrBuf) { flagStderrLine(stderrBuf); stderrBuf = ""; }
-        // A disconnected client must not start a new PDF render. Still finish
-        // the run here: an enqueue failure closes the transport without calling
-        // cancel(), and must not leave the tracker guard held forever.
-        if (closed) return close();
+        // Already finalized (a spawn error ended it). A disconnected client is
+        // NOT a reason to stop here: the gates, the persist and the render below
+        // still run, so the work is recorded whether or not anyone is reading.
+        if (ch.finalized) return;
         // A timeout is the ROOT cause behind every "no report / not clean"
         // symptom the gates below test, so classify it FIRST, for any kind.
         // Otherwise a run we cut off at the time limit reads as "the CLI couldn't
@@ -578,9 +595,8 @@ export async function POST(req: Request) {
           } else {
             sendWarnings(envelope.warnings);
             if (saveCv(pdfPaths, envelope)) {
-              // Tracked so cancel() can defer releasing writeToken until this
-              // settles; close() happens once rendering finishes, not here.
-              pdfRenderPromise = renderPdf(pdfPaths, envelope.format);
+              // close() happens once rendering finishes, not here.
+              void renderPdf(pdfPaths, envelope.format);
               return;
             }
             // saveCv already streamed the specific reason.
@@ -603,7 +619,8 @@ export async function POST(req: Request) {
           } else if (envelope?.ok !== true) {
             send({ type: "error", msg: "Internal error: the evaluate run passed its gate with no report to save — please report this." });
           } else {
-            evaluatePersistPromise = persistEval(envelope.markdown);
+            // close() happens once the persist settles, not here.
+            void persistEval(envelope.markdown);
             return;
           }
           return close();
@@ -630,24 +647,21 @@ export async function POST(req: Request) {
       });
     },
     cancel() {
-      closed = true;
+      // The reader went away: a locked phone, a closed tab, a backgrounded PWA.
+      // That is not a reason to destroy the work. The child keeps running, the
+      // transcript keeps accruing, and the client resubscribes from the job log.
+      // The kill timer stays armed, so a stuck agent is still bounded, and the
+      // tracker guard stays held: close() releases it when the run really ends,
+      // after any persist or render still writing the tracker.
+      channel?.detach();
       if (heartbeat) clearInterval(heartbeat);
-      if (killer) clearTimeout(killer);
-      try { child.kill("SIGTERM"); } catch { /* ignore */ }
-      const followup = pdfRenderPromise ?? evaluatePersistPromise;
-      if (followup) {
-        // Render/mark or evaluate persist keeps running after this client
-        // disconnects. Wait for it before releasing the guard, so a concurrent
-        // tracker delete cannot race the still-in-flight write.
-        followup.finally(finishRun);
-      } else {
-        finishRun();
-      }
     },
   });
 
   return new Response(stream, {
     headers: {
+      // Lets a client that did not send its own id still find the run.
+      "X-Job-Id": jobId,
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       "X-Accel-Buffering": "no",

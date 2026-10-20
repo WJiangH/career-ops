@@ -30,6 +30,12 @@ export interface JobMeta {
   endedAt?: number;
   tokens?: number;
   costUsd?: number | null;
+  reportN?: number;
+  /**
+   * The server process that owns the child. A "running" job owned by another
+   * process was orphaned by a restart: its child died with that process.
+   */
+  owner?: string;
   /** Final one-line outcome — the verdict for an evaluation, or the error. */
   summary?: string;
   /**
@@ -56,8 +62,15 @@ function paths(id: string): { meta: string; events: string } {
   return { meta: path.join(dir, `${id}.json`), events: path.join(dir, `${id}.ndjson`) };
 }
 
-export function createJob(meta: Omit<JobMeta, "status" | "startedAt">): JobMeta {
-  const full: JobMeta = { ...meta, status: "running", startedAt: Date.now() };
+// Identifies this server process. Not a module-level random id: Next can load
+// this module once per route bundle, and every copy must agree. pid plus the
+// process's own start time cannot repeat across a restart the way a bare pid can.
+export function serverOwner(): string {
+  return `${process.pid}-${Math.round(performance.timeOrigin)}`;
+}
+
+export function createJob(meta: Omit<JobMeta, "status" | "startedAt" | "owner">): JobMeta {
+  const full: JobMeta = { ...meta, status: "running", startedAt: Date.now(), owner: serverOwner() };
   const p = paths(full.id);
   fs.writeFileSync(p.meta, JSON.stringify(full, null, 2));
   fs.writeFileSync(p.events, "");
@@ -134,17 +147,28 @@ export function listJobs(limit = 50): JobMeta[] {
   return jobs.slice(0, limit);
 }
 
+const ORPHANED = "Interrupted — the server restarted while this was running.";
+
 /**
- * Mark still-"running" jobs from a previous server process as errored.
- * The child was a child of THAT process: a restart orphans it, and without this
- * the job list shows a spinner that can never resolve. Called once at startup.
+ * Settle one job if it is "running" under a previous server process. Its child
+ * was a child of THAT process, so nothing will ever finish it, and a client
+ * following its log would wait forever. A job this process owns is left alone.
+ */
+export function reapIfOrphaned(job: JobMeta): JobMeta {
+  if (job.status !== "running" || job.owner === serverOwner()) return job;
+  finishJob(job.id, { status: "error", summary: ORPHANED });
+  return readJob(job.id) ?? { ...job, status: "error", summary: ORPHANED };
+}
+
+/**
+ * Mark still-"running" jobs from a previous server process as errored. Safe to
+ * call at any time, not only at startup: ownership, not "running", decides, so
+ * a run this process started a moment ago is never reaped.
  */
 export function reapStaleJobs(): number {
   let n = 0;
   for (const j of listJobs(200)) {
-    if (j.status !== "running") continue;
-    finishJob(j.id, { status: "error", summary: "Interrupted — the server restarted while this was running." });
-    n++;
+    if (reapIfOrphaned(j) !== j) n++;
   }
   return n;
 }

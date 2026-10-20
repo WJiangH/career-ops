@@ -7,11 +7,17 @@
  * Read the /api/run NDJSON protocol. A closed connection is not proof that the
  * worker saved its report or rendered its PDF: only the server's `done` event is.
  *
+ * `onRecord` sees every transcript record, terminal ones included, and never a
+ * keepalive: the server logs exactly those records before streaming them, so
+ * their count is the offset a client resumes the job log from, and an error
+ * completion with no terminal record means the connection ended, not the run.
+ *
  * @param {ReadableStream<Uint8Array>} stream
  * @param {(event: JobProgress) => void} onProgress
+ * @param {(record: Record<string, unknown>) => void} [onRecord]
  * @returns {Promise<JobCompletion>}
  */
-export async function readJobStream(stream, onProgress) {
+export async function readJobStream(stream, onProgress, onRecord) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -26,6 +32,7 @@ export async function readJobStream(stream, onProgress) {
     } catch {
       return { status: "error", message: "Invalid response from the local server. Check the pipeline before retrying." };
     }
+    if (onRecord && event && typeof event === "object" && event.type !== "keepalive") onRecord(event);
     if (event?.type === "error") {
       return { status: "error", message: typeof event.msg === "string" && event.msg ? event.msg : "Error" };
     }

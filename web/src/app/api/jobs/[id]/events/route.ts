@@ -1,5 +1,4 @@
-import { NextResponse } from "next/server";
-import { readEvents, readJob } from "@/lib/core/job-log";
+import { reapIfOrphaned, readEvents, readJob } from "@/lib/core/job-log";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,18 +15,25 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
   const url = new URL(_req.url);
   const from = Math.max(0, Number(url.searchParams.get("from") ?? 0) || 0);
 
-  const meta = readJob(id);
-  if (!meta) return NextResponse.json({ error: "unknown job" }, { status: 404 });
+  let meta: ReturnType<typeof readJob>;
+  try {
+    meta = readJob(id);
+  } catch {
+    return Response.json({ error: "invalid job id" }, { status: 400 });
+  }
+  if (!meta) return Response.json({ error: "unknown job" }, { status: 404 });
+  // A follower polls only this route, so it has to see a restart here too.
+  meta = reapIfOrphaned(meta);
 
   let events: unknown[] = [];
   let nextLine = from;
   try {
     ({ events, nextLine } = readEvents(id, from));
   } catch {
-    return NextResponse.json({ error: "invalid job id" }, { status: 400 });
+    return Response.json({ error: "invalid job id" }, { status: 400 });
   }
 
-  return NextResponse.json(
+  return Response.json(
     { job: meta, events, nextLine, running: meta.status === "running" },
     { headers: { "Cache-Control": "no-store" } },
   );

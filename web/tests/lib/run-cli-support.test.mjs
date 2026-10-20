@@ -21,6 +21,7 @@ import {
   parseClaudeEvent,
   parseCodexEvent,
   parseGrokEvent,
+  describeToolInput,
 } from "../../src/lib/run-cli-support.mjs";
 import { createCvEnvelopeFilter } from "../../src/lib/cv-envelope.mjs";
 
@@ -620,4 +621,27 @@ test("a timed-out run reads as a timeout, never as 'didn't save a report' (#3124
   assert.match(msg, /780s time limit/, "the message names the limit it hit");
   assert.match(msg, /re-run|Claude Code/i, "it offers a next step");
   assert.doesNotMatch(msg, /didn't save a report/i, "a timeout must not be blamed on the CLI's ability to write");
+});
+
+test("tool events carry the argument when the CLI's tool-start event has one", () => {
+  assert.deepEqual(
+    parseCodexEvent(JSON.stringify({ type: "item.started", item: { type: "command_execution", command: "/bin/bash -lc 'node verify-pipeline.mjs'" } })),
+    { tool: "Bash", toolDetail: "node verify-pipeline.mjs" },
+  );
+  assert.deepEqual(
+    parseCodexEvent(JSON.stringify({ type: "item.started", item: { type: "web_search", query: "Acme layoffs 2026" } })),
+    { tool: "WebSearch", toolDetail: "Acme layoffs 2026" },
+  );
+  assert.deepEqual(
+    parseGrokEvent(JSON.stringify({ type: "tool_call", toolName: "Web search:", rawInput: { query: "acme" } })),
+    { tool: "Web search", toolDetail: "acme" },
+  );
+  assert.deepEqual(parseGrokEvent(JSON.stringify({ type: "tool_call", toolName: "read_file" })), { tool: "read_file" });
+});
+
+test("describeToolInput keeps one meaningful line and nothing it does not recognise", () => {
+  assert.equal(describeToolInput({ file_path: "/srv/me/Projects/career-ops/modes/oferta.md" }), "modes/oferta.md");
+  assert.equal(describeToolInput({ command: "a".repeat(100) }).length, 72);
+  assert.equal(describeToolInput({ secret: "x" }), "");
+  assert.equal(describeToolInput(null), "");
 });
