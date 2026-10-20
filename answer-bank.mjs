@@ -32,13 +32,13 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import * as yaml from 'js-yaml';
-import { getCareerOpsRoot } from './path-resolver.mjs';
+import { getCareerOpsRoot, getProfilePath } from './path-resolver.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
+import { loadYaml } from './lib/yaml-document.mjs';
 
 const DATA_ROOT = getCareerOpsRoot();
 const BANK_PATH = join(DATA_ROOT, 'data', 'answer-bank.json');
-const PROFILE_PATH = process.env.CAREER_OPS_PROFILE || join(DATA_ROOT, 'config', 'profile.yml');
+const PROFILE_PATH = getProfilePath();
 
 // ── matching ─────────────────────────────────────────────────────────────────
 //
@@ -234,7 +234,13 @@ const flag = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : n
 const flags = (f) => argv.map((a, i) => (a === f ? argv[i + 1] : null)).filter(Boolean);
 const cmd = argv[0];
 
+/** The Usage block of this file's header comment. */
+function usage() {
+  return readFileSync(new URL(import.meta.url), 'utf8').split('*/')[0].split('\n').filter((l) => /Usage|node answer-bank/.test(l)).map((l) => l.replace(/^ \* ?/, '')).join('\n');
+}
+
 if (isMainModule(import.meta.url)) {
+  if (argv.includes('--help') || argv.includes('-h')) { console.log(usage()); process.exit(0); }
   if (argv.includes('--self-test')) selfTest();
   else if (cmd === 'lookup') {
     const q = argv[1]; if (!q) { console.error('usage: node answer-bank.mjs lookup "<question>"'); process.exit(1); }
@@ -252,7 +258,7 @@ if (isMainModule(import.meta.url)) {
     const e = upsert(bank, { question, answer: flag('--answer'), aliases: flags('--alias'), source: flag('--source') || (flag('--answer') ? `user-stated ${new Date().toISOString().slice(0, 10)}` : null), confirm_each_time: argv.includes('--confirm-each-time'), scope: flag('--scope') || 'global', note: flag('--note'), pending: argv.includes('--pending'), intent_match: argv.includes('--intent-match') ? true : null });
     saveBank(bank); console.log(JSON.stringify(e, null, 2));
   } else if (cmd === 'seed') {
-    const profile = existsSync(PROFILE_PATH) ? yaml.load(readFileSync(PROFILE_PATH, 'utf8')) : null;
+    const profile = existsSync(PROFILE_PATH) ? loadYaml(readFileSync(PROFILE_PATH, 'utf8')) : null;
     if (!profile) { console.error(`config/profile.yml not found at ${PROFILE_PATH}`); process.exit(1); }
     const bank = loadBank(); let n = 0;
     for (const s of seedFromProfile(profile)) { upsert(bank, s); n++; }
@@ -262,6 +268,6 @@ if (isMainModule(import.meta.url)) {
     if (argv.includes('--json')) console.log(JSON.stringify(bank, null, 2));
     else for (const e of bank.entries) console.log(`${(e.status === 'answered' ? '✅' : '❓').padEnd(2)} ${e.id.padEnd(34)} ${String(e.answer ?? '(needs your answer)').slice(0, 60).padEnd(62)} ${e.confirm_each_time ? '[confirm each time] ' : ''}${e.scope !== 'global' ? `[${e.scope}] ` : ''}← ${e.source ?? '—'}`);
   } else {
-    console.log(readFileSync(new URL(import.meta.url), 'utf8').split('*/')[0].split('\n').filter((l) => /Usage|node answer-bank/.test(l)).map((l) => l.replace(/^ \* ?/, '')).join('\n'));
+    console.log(usage());
   }
 }

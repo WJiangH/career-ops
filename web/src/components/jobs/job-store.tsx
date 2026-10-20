@@ -19,8 +19,20 @@ import { createWorkerFeedback } from "@/lib/worker-feedback.mjs";
 import { readJobStream } from "@/lib/job-stream.mjs";
 import { createJobsPersister } from "@/lib/jobs-persist.mjs";
 
-export type JobStep = { kind: "tool" | "status"; label: string; ts: number };
+// `detail` is the tool's argument (file read, command run, query searched).
+export type JobStep = { kind: "tool" | "status"; label: string; detail?: string; ts: number };
 export type JobResult = { score: number | null; summary: string; tone: "good" | "warn" | "bad" | "muted" };
+
+// The report's Machine Summary, shown by the fork's /jobs/[id] page. Nothing on
+// this store fills it or `JobStep.detail` yet: that comes back with the fork's
+// server-owned runs, which this merge did not carry over.
+export type JobTldr = {
+  company?: string; role?: string; score?: number; archetype?: string;
+  final_decision?: string; legitimacy_tier?: string; work_auth?: string;
+  risk_level?: string; confidence?: string; next_action?: string;
+  hard_stops?: string[]; soft_gaps?: string[]; top_strengths?: string[];
+  report?: string;
+};
 
 export type Job = {
   id: string;
@@ -36,6 +48,7 @@ export type Job = {
   result?: JobResult;
   cost?: { tokens: number; usd?: number }; // per-run token cost (Claude result event) — local only
   reportN?: number | null;
+  tldr?: JobTldr;
   startedAt: number;
   endedAt?: number;
 };

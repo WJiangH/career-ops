@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { careerOpsRoot, rootScript } from "@/lib/career-ops";
+import { readJsonObject } from "@/lib/json-body";
 
 // AI keyword suggestion for the Explorer's filter builder: runs the core's
 // titles-suggest.mjs headless (cv.md → {roles, candidates, exclude}, every
@@ -25,12 +26,8 @@ export type SuggestResponse = {
 };
 
 export async function POST(req: Request) {
-  let body: { cliId?: string; hint?: string } = {};
-  try {
-    body = (await req.json()) as typeof body;
-  } catch {
-    /* empty body is fine */
-  }
+  // An empty or malformed body is fine: both fields are optional.
+  const body = (await readJsonObject<{ cliId?: string; hint?: string }>(req)) ?? {};
   const root = careerOpsRoot();
   const script = rootScript("titles-suggest");
   if (!fs.existsSync(script)) {

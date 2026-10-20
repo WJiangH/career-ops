@@ -54,7 +54,7 @@ import { readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import * as yaml from 'js-yaml';
+import { loadYaml } from './lib/yaml-document.mjs';
 import {
   deriveKeywords, readCv, unsupportedByCv, redundancyGroups,
   readTargetRoles, targetVocabulary, isOnTarget,
@@ -155,7 +155,7 @@ if (INIT) {
 }
 
 const portalsRaw = read('portals.yml');
-const portals = portalsRaw ? yaml.load(portalsRaw) : null;
+const portals = portalsRaw ? loadYaml(portalsRaw) : null;
 const currentPositive = portals?.title_filter?.positive ?? [];
 
 // ── mechanical layer ─────────────────────────────────────────────────────────

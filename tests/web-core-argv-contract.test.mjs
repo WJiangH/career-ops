@@ -40,6 +40,14 @@ console.log('\nweb → core argv contract');
 //                  bottom stays complete.
 const CALL_SITES = [
   {
+    // Fork: Explore → Suggest from CV. flags-only, since a real run asks the
+    // agent CLI to read cv.md.
+    source: 'web/src/app/api/explore/suggest/route.ts',
+    script: 'titles-suggest.mjs',
+    args: ['--json', '--cli', 'claude', '--hint', 'x'],
+    probe: 'flags-only',
+  },
+  {
     source: 'web/src/app/api/followups/route.ts',
     script: 'followup-cadence.mjs',
     args: ['--json'],

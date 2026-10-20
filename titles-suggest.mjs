@@ -41,7 +41,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import * as yaml from 'js-yaml';
+import { loadYaml } from './lib/yaml-document.mjs';
 import { getCareerOpsRoot } from './path-resolver.mjs';
 import { validateFlags } from './lib/cli-flags.mjs';
 import { pickCli, askAgent } from './lib/agent-run.mjs';
@@ -102,7 +102,7 @@ if (INIT) {
 }
 
 const portalsRaw = readUser('portals.yml');
-const portals = portalsRaw ? yaml.load(portalsRaw) : null;
+const portals = portalsRaw ? loadYaml(portalsRaw) : null;
 const baseline = portals?.title_filter
   ? { positive: portals.title_filter.positive ?? [], negative: portals.title_filter.negative ?? [] }
   : null;
