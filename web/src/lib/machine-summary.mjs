@@ -1,120 +1,141 @@
-// Parse the `## Machine Summary` YAML block that every evaluation report ends
-// with (see modes/oferta.md). This is the report's own TL;DR — structured, not
-// prose — and it is what a phone should show when a run finishes.
-//
-// Without it the run pane showed the agent's inter-tool narration ("Now let's
-// release the reservation, write the tracker TSV, and merge.") because the
-// client displayed the tail of the text stream. The actual product was never in
-// that stream at all: the agent Writes it to reports/{num}-{slug}-{date}.md.
-
-import fs from "node:fs";
-import path from "node:path";
 import * as yaml from "js-yaml";
 
 /**
- * @typedef {object} MachineSummary
- * @property {string} [company]
- * @property {string} [role]
- * @property {number} [score]
- * @property {string} [legitimacy_tier]
- * @property {string} [archetype]
- * @property {string} [final_decision]
- * @property {string[]} [hard_stops]
- * @property {string[]} [soft_gaps]
- * @property {string[]} [top_strengths]
- * @property {string} [risk_level]
- * @property {string} [confidence]
- * @property {string} [next_action]
- * @property {string} [work_auth]
- * @property {string} [report] Path relative to the career-ops root, so the UI can link to the full report.
+ * @typedef {"critical"|"high"|"meaningful"|"preferred"|"low_signal"} Importance
+ * @typedef {{ requirement: string, importance: Importance, match: string }} Requirement
+ * @typedef {{
+ *   decision: string,
+ *   strengths: string[],
+ *   hardStops: string[],
+ *   softGaps: string[],
+ *   requirements: Requirement[],
+ *   confidenceGaps: string[],
+ *   unknownEvidence: string[],
+ * }} MachineSummary
+ * @typedef {{ text: string, importance: Importance | null }} Lever
+ * @typedef {{ holding: Lever[], close: Lever[], verify: string[], strengths: string[] }} ScoreLevers
  */
 
+const IMPORTANCE_RANK = { critical: 0, high: 1, meaningful: 2, preferred: 3, low_signal: 4 };
 
-const STR_KEYS = ["company", "role", "legitimacy_tier", "archetype", "final_decision", "risk_level", "confidence", "next_action", "work_auth"];
-const LIST_KEYS = ["hard_stops", "soft_gaps", "top_strengths"];
+const EVIDENCE_LABEL = {
+  cv_match: "CV match",
+  north_star: "North Star alignment",
+  compensation: "Compensation",
+  culture: "Culture",
+  red_flags: "Red flags",
+};
+
+const FENCE = /##\s*Machine Summary\s*\n+```(?:yaml|yml)?\s*\n([\s\S]*?)\n```/i;
+
+const strings = (v) => (Array.isArray(v) ? v.map((s) => String(s ?? "").trim()).filter(Boolean) : []);
 
 /**
- * Pull the Machine Summary out of a report's markdown.
- *
- * Returns null rather than throwing: a report whose block is missing or
- * malformed must still count as a completed run — the score and the tracker row
- * are already persisted, and losing the summary should degrade the display, not
- * turn a successful evaluation into a failure.
+ * The report's Machine Summary, or null when the report has none or its YAML
+ * does not parse. Older reports predate the block.
+ * @param {string} report
+ * @returns {MachineSummary | null}
  */
-/** @param {string} markdown @returns {MachineSummary|null} */
-export function parseMachineSummary(markdown) {
-  // Tolerate "## Machine Summary" at any heading depth and an optional
-  // language tag on the fence; oferta.md specifies ```yaml but reports are
-  // agent-written and drift.
-  const m = markdown.match(/#{1,4}\s*Machine Summary\s*\n+```[a-zA-Z]*\n([\s\S]*?)\n```/);
-  if (!m) return null;
-
-  let doc;
+export function readMachineSummary(report) {
+  const fence = String(report ?? "").match(FENCE)?.[1];
+  if (!fence) return null;
+  let raw;
   try {
-    doc = yaml.load(m[1]);
+    raw = yaml.load(fence);
   } catch {
     return null;
   }
-  if (!doc || typeof doc !== "object") return null;
-  const raw = doc;
-
-  // Copy only known keys, coercing shapes. An agent that emits a bare string
-  // where a list belongs (it happens) should still render, not blow up a map().
-  /** @type {MachineSummary} */
-  const out = {};
-  for (const k of STR_KEYS) {
-    const v = raw[k];
-    if (typeof v === "string" && v.trim()) out[k] = v.trim();
-  }
-  for (const k of LIST_KEYS) {
-    const v = raw[k];
-    if (Array.isArray(v)) out[k] = v.filter((x) => typeof x === "string" && x.trim() !== "");
-    else if (typeof v === "string" && v.trim()) out[k] = [v.trim()];
-  }
-  const score = typeof raw.score === "number" ? raw.score : Number(raw.score);
-  if (Number.isFinite(score)) out.score = score;
-
-  return Object.keys(out).length > 0 ? out : null;
+  if (!raw || typeof raw !== "object") return null;
+  const evidence = raw.score_evidence && typeof raw.score_evidence === "object" ? raw.score_evidence : {};
+  return {
+    decision: String(raw.final_decision ?? "").trim(),
+    strengths: strings(raw.top_strengths),
+    hardStops: strings(raw.hard_stops),
+    softGaps: strings(raw.soft_gaps),
+    requirements: (Array.isArray(raw.requirement_importance) ? raw.requirement_importance : [])
+      .filter((r) => r && String(r.requirement ?? "").trim() && Object.hasOwn(IMPORTANCE_RANK, String(r.importance)))
+      .map((r) => ({
+        requirement: String(r.requirement).trim(),
+        importance: /** @type {Importance} */ (String(r.importance)),
+        match: String(r.match ?? "").trim(),
+      })),
+    confidenceGaps: strings(raw.confidence_gaps),
+    unknownEvidence: Object.entries(EVIDENCE_LABEL)
+      .filter(([key]) => evidence[key] === "unknown")
+      .map(([, label]) => label),
+  };
 }
 
-/** Read + parse a report file. Never throws. */
-/** @param {string} root @param {string} relPath @returns {MachineSummary|null} */
-export function readMachineSummary(root, relPath) {
-  try {
-    const s = parseMachineSummary(fs.readFileSync(path.join(root, relPath), "utf8"));
-    return s ? { ...s, report: relPath } : null;
-  } catch {
-    return null;
-  }
+/** @param {Requirement[]} rows @param {string} match */
+function byImportance(rows, match) {
+  return rows
+    .filter((r) => r.match === match && IMPORTANCE_RANK[r.importance] <= IMPORTANCE_RANK.meaningful)
+    .sort((a, b) => IMPORTANCE_RANK[a.importance] - IMPORTANCE_RANK[b.importance])
+    .map((r) => ({ text: r.requirement, importance: r.importance }));
 }
 
 /**
- * The report file an evaluation just produced.
- *
- * Identified by set difference against a snapshot taken before the agent ran,
- * not by "newest mtime": two evaluations can run concurrently, and picking the
- * newest would hand one run the other's summary.
+ * What holds a score down, what is a near miss, and what to confirm before
+ * trusting it. Preferred and low-signal requirements are left out because
+ * they do not move the score.
+ * @param {MachineSummary} s
+ * @returns {ScoreLevers}
  */
-/** @param {string} root @param {Set<string>} before @returns {string|null} */
-export function newReportSince(root, before) {
-  let names;
-  try {
-    names = fs.readdirSync(path.join(root, "reports")).filter((f) => f.endsWith(".md") && !f.includes("RESERVED"));
-  } catch {
-    return null;
-  }
-  const added = names.filter((n) => !before.has(n));
-  if (added.length === 0) return null;
-  added.sort(); // deterministic when an agent somehow wrote more than one
-  return path.join("reports", added[added.length - 1]);
+export function scoreLevers(s) {
+  const partial = byImportance(s.requirements, "partial");
+  const listed = new Set(partial.map((r) => r.text.toLowerCase()));
+  return {
+    holding: [...s.hardStops.map((text) => ({ text, importance: null })), ...byImportance(s.requirements, "missing")],
+    close: [
+      ...partial,
+      ...[...new Set(s.softGaps)].filter((text) => !listed.has(text.toLowerCase())).map((text) => ({ text, importance: null })),
+    ],
+    verify: [...s.confidenceGaps, ...s.unknownEvidence.map((label) => `${label} evidence is unknown`)],
+    strengths: s.strengths,
+  };
 }
 
-/** Snapshot of reports/ for `newReportSince` to diff against. */
-/** @param {string} root @returns {Set<string>} */
-export function snapshotReports(root) {
-  try {
-    return new Set(fs.readdirSync(path.join(root, "reports")).filter((f) => f.endsWith(".md") && !f.includes("RESERVED")));
-  } catch {
-    return new Set();
-  }
+/**
+ * @typedef {{ decision: string, plus: string | null, minus: string | null }} CardReason
+ */
+
+/**
+ * The one-line reason a Today card shows: the evaluator's call, the strongest
+ * match, and the biggest thing holding the score down.
+ * @param {string} report
+ * @returns {CardReason | null}
+ */
+export function cardReason(report) {
+  const s = readMachineSummary(report);
+  if (!s) return null;
+  const { holding, close } = scoreLevers(s);
+  const reason = { decision: s.decision, plus: s.strengths[0] ?? null, minus: (holding[0] ?? close[0])?.text ?? null };
+  return reason.decision || reason.plus || reason.minus ? reason : null;
+}
+
+/**
+ * @typedef {{ requirement: string, importance: Importance, match: string, question: string }} PrepQuestion
+ */
+
+const QUESTION_BY_MATCH = {
+  strong: (r) => `Walk me through your strongest example of ${r}. What was the outcome?`,
+  partial: (r) => `Where have you used ${r}, and how deep did you go?`,
+  missing: (r) => `The role asks for ${r}. How would you close that gap?`,
+};
+
+/**
+ * Likely screening questions, one per important requirement, most important
+ * first. A requirement listed twice keeps only its most important entry. The match verdict picks the question: proof for a strong match,
+ * depth for a partial one, a gap plan for a missing one.
+ * @param {MachineSummary} s
+ * @param {number} [limit]
+ * @returns {PrepQuestion[]}
+ */
+export function prepQuestions(s, limit = 6) {
+  return s.requirements
+    .filter((r) => Object.hasOwn(QUESTION_BY_MATCH, r.match) && IMPORTANCE_RANK[r.importance] <= IMPORTANCE_RANK.meaningful)
+    .sort((a, b) => IMPORTANCE_RANK[a.importance] - IMPORTANCE_RANK[b.importance])
+    .filter((r, i, all) => all.findIndex((o) => o.requirement === r.requirement) === i)
+    .slice(0, limit)
+    .map((r) => ({ ...r, question: QUESTION_BY_MATCH[r.match](r.requirement) }));
 }

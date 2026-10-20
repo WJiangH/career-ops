@@ -14,6 +14,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
 import { decodeEntities } from './providers/_html-entities.mjs';
+import { safeEncodeURIComponent } from './providers/_safe-url.mjs';
 import { BROWSER_LIKE_USER_AGENT } from './user-agent.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
 import { getCareerOpsRoot } from './path-resolver.mjs';
@@ -36,12 +37,17 @@ const RSS_SOURCES = {
     'https://www.prnewswire.com/rss/venture-capital-list.rss',
   ],
   guardian: ['https://www.theguardian.com/technology/rss'],
+  // Opt-in (not in DEFAULT_SOURCES): public, no-auth RSS checked 2026-10-16.
+  // Tech trade press that regularly carries funding announcements: a 1-month
+  // dry run read 30 items, 8 funding-like, and produced 4 candidates.
+  siliconangle: ['https://siliconangle.com/feed/'],
 };
 
 const SOURCE_HOSTS = {
   techcrunch: ['techcrunch.com'],
   prnewswire: ['prnewswire.com'],
   guardian: ['theguardian.com'],
+  siliconangle: ['siliconangle.com'],
   hacker_news: ['hn.algolia.com', 'news.ycombinator.com'],
 };
 
@@ -49,6 +55,7 @@ const SOURCE_RANK = {
   techcrunch: 70,
   prnewswire: 65,
   guardian: 50,
+  siliconangle: 45,
   hacker_news: 35,
   web: 5,
 };
@@ -93,6 +100,7 @@ Options:
   --months <n>            Recent-funding window. Default: 3.
   --sort <date|score>     Candidate ordering. Default: date.
   --sources <csv>         Sources. Default: techcrunch,prnewswire,guardian,hn.
+                          Also available: siliconangle.
   --dry-run               Print only; do not write report/JSON files.
   --json                  Print machine-readable JSON.
   --self-test             Run offline self-test.
@@ -140,7 +148,7 @@ function parseSources(value) {
     .map((s) => normalizeSourceName(s.trim()))
     .filter(Boolean);
   const unique = [...new Set(out)];
-  const allowed = new Set(['techcrunch', 'prnewswire', 'guardian', 'hn']);
+  const allowed = new Set(['techcrunch', 'prnewswire', 'guardian', 'siliconangle', 'hn']);
   for (const source of unique) {
     if (!allowed.has(source)) throw new Error(`unknown source in --sources: ${source}`);
   }
@@ -772,9 +780,9 @@ function hnQueries() {
   ];
 }
 
-async function fetchHnDiscovery({ months = DEFAULT_MONTHS, diagnostics = [] } = {}) {
+async function fetchHnDiscovery({ months = DEFAULT_MONTHS, now = new Date(), diagnostics = [] } = {}) {
   const diag = diagnostics.find((d) => d.source === 'hn') || diagnostic('hn');
-  const cutoff = Math.floor(Date.now() / 1000) - months * 31 * 24 * 60 * 60;
+  const cutoff = Math.floor(now.getTime() / 1000) - months * 31 * 24 * 60 * 60;
   const out = [];
   for (const query of hnQueries()) {
     const url =
@@ -790,7 +798,11 @@ async function fetchHnDiscovery({ months = DEFAULT_MONTHS, diagnostics = [] } = 
     for (const hit of hits) {
       const title = compact(hit.title || hit.story_title || '');
       if (!title) continue;
-      const fallbackUrl = `https://news.ycombinator.com/item?id=${encodeURIComponent(String(hit.objectID || ''))}`;
+      // A lone surrogate in objectID would throw URIError out of
+      // encodeURIComponent and abort the loop over the remaining hits; fall back
+      // to no synthetic URL (hit.url is tried first anyway).
+      const encodedId = safeEncodeURIComponent(hit.objectID || '');
+      const fallbackUrl = encodedId === null ? '' : `https://news.ycombinator.com/item?id=${encodedId}`;
       const itemUrl = trustedEvidenceUrl(hit.url || '', '') || trustedEvidenceUrl(fallbackUrl, 'hacker_news');
       const item = {
         source: 'hacker_news',
@@ -814,11 +826,11 @@ async function fetchHnDiscovery({ months = DEFAULT_MONTHS, diagnostics = [] } = 
 async function collectDiscoveryItems(opts, diagnostics) {
   const requested = new Set(opts.sources || DEFAULT_SOURCES);
   const hits = [];
-  for (const source of ['techcrunch', 'prnewswire', 'guardian']) {
+  for (const source of ['techcrunch', 'prnewswire', 'guardian', 'siliconangle']) {
     if (requested.has(source)) hits.push(...await fetchRssDiscovery(source, diagnostics));
   }
   if (requested.has('hn')) {
-    hits.push(...await fetchHnDiscovery({ months: opts.months, diagnostics }));
+    hits.push(...await fetchHnDiscovery({ months: opts.months, now: opts.now, diagnostics }));
   }
   return hits;
 }
@@ -929,20 +941,24 @@ function printHuman(result) {
 
 export async function discoverFundedCompanies(opts = {}) {
   const months = opts.months || DEFAULT_MONTHS;
+  // The moment the window is measured back from; one value for the whole run,
+  // copied so a caller changing its own Date cannot move it mid-run.
+  const now = opts.now instanceof Date ? new Date(opts.now.getTime()) : new Date();
   const sources = (opts.sources || DEFAULT_SOURCES).map(normalizeSourceName);
   const diagnostics = [...new Set(sources)].map(diagnostic);
   const hits = Array.isArray(opts.discoveryItems)
     ? opts.discoveryItems
-    : await collectDiscoveryItems({ ...opts, months, sources }, diagnostics);
+    : await collectDiscoveryItems({ ...opts, months, sources, now }, diagnostics);
   const companies = buildCandidates(hits, {
     months,
     sort: opts.sort || DEFAULT_SORT,
     limit: opts.limit || DEFAULT_LIMIT,
+    now,
     diagnostics,
   });
 
   return {
-    generated_at: isoDate(),
+    generated_at: isoDate(now),
     window_months: months,
     sort: opts.sort || DEFAULT_SORT,
     dry_run: Boolean(opts.dryRun),

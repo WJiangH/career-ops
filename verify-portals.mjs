@@ -25,24 +25,84 @@
  *   node verify-portals.mjs --strict        # exit non-zero if any slug is unresolved
  *                                           #   (with --unmined: if any board is unmined)
  *   node verify-portals.mjs --file <path>   # use a specific portals file
+ *   node verify-portals.mjs --help          # print this usage block and exit
  *
  * Network: only the sweep / --add paths hit the network. Importing the module
  * (for tests) runs nothing — main() is guarded — and all network access goes
  * through an injectable `fetchJson`, so the pure logic is testable offline.
+ * `--help`/`-h` and an unrecognized flag are both handled BEFORE that network
+ * work starts (#4250) — this script had never adopted `lib/cli-flags.mjs`'s
+ * `validateFlags()`, unlike its siblings (audit-portals.mjs, scan.mjs), so
+ * `--help` fell through main()'s argument checks untouched and ran the exact
+ * same full portals.yml sweep as no flags at all. On a config with ~170
+ * tracked companies that is minutes of sequential network probing with zero
+ * output until it finishes — indistinguishable from a genuine hang, which is
+ * exactly how it was reported: "`--help` behaves the same [as no args]".
  */
 
 import { existsSync, readFileSync } from 'fs';
-import { dirname, resolve } from 'path';
+import { isIP } from 'net';
+import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
-import * as yaml from 'js-yaml';
+import { loadYaml } from './lib/yaml-document.mjs';
 
 import { fetchJson as defaultFetchJson, fetchTextHead as defaultFetchText, makeHttpCtx } from './providers/_http.mjs';
+import { isBlockedAddress } from './providers/_ip-guard.mjs';
+
+// The portal probes are the one place that keeps following redirects: they hit
+// the ATS vendors' own hosts, and a moved board answers with a 3xx. `_http.mjs`
+// refuses redirects by default (#4079), so the probes follow them here, one hop
+// at a time under redirect:'manual', and each hop is checked like the first
+// request. A hostname is checked where it resolves (providers/_ip-guard.mjs),
+// but a literal address is dialled without a lookup, so it is checked here.
+const MAX_PROBE_REDIRECTS = 5;
+
+/** Where a refused 3xx points, or null when the probe must not go there. */
+function probeRedirectTarget(err, from) {
+  const status = err?.status;
+  if (typeof status !== 'number' || status < 300 || status >= 400 || !err.location) return null;
+  let next;
+  try {
+    next = new URL(err.location, from);
+  } catch {
+    return null;
+  }
+  if (next.protocol !== 'https:' && next.protocol !== 'http:') return null;
+  const host = next.hostname.replace(/^\[|\]$/g, '');
+  if (isIP(host) && isBlockedAddress(host)) return null;
+  return next.href;
+}
+
+const followRedirects = (fetchFn) => async (url, opts = {}) => {
+  let current = url;
+  for (let hop = 0; ; hop++) {
+    try {
+      return await fetchFn(current, { ...opts, redirect: 'manual' });
+    } catch (err) {
+      const next = hop < MAX_PROBE_REDIRECTS ? probeRedirectTarget(err, current) : null;
+      if (next === null) throw err;
+      current = next;
+    }
+  }
+};
+const probeFetchJson = followRedirects(defaultFetchJson);
+const probeFetchText = followRedirects(defaultFetchText);
 import { decodeEntities } from './providers/_html-entities.mjs';
 import { asciiFold } from './lib/ascii-fold.mjs';
 import { loadProviders, resolveProvider } from './providers/_registry.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
+import { flagValue, hasFlag, validateFlags } from './lib/cli-flags.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
-const DEFAULT_PORTALS_PATH = process.env.CAREER_OPS_PORTALS || 'portals.yml';
+// getCareerOpsRoot() (not a bare 'portals.yml'): scan.mjs, scan-ats-full.mjs
+// and audit-portals.mjs all resolve their default portals.yml against the
+// Data Root (CAREER_OPS_ROOT / CAREER_OPS_DATA_DIR / .career-ops-data —
+// AGENTS.md's Path Resolution Override & Precedence), so this script was the
+// one place still assuming the Data Root equals the current working
+// directory — the same split-checkout mismatch class as #3867, just for
+// this script's default path (CodeRabbit, #4254 review).
+const DATA_ROOT = getCareerOpsRoot();
+const DEFAULT_PORTALS_PATH = process.env.CAREER_OPS_PORTALS || join(DATA_ROOT, 'portals.yml');
 
 // The core providers/ directory — the SAME plugins the scanner loads. Resolved
 // from this file's location so it's independent of the caller's cwd.
@@ -381,7 +441,12 @@ export function unminedHints(cfg) {
   for (const entry of cfg?.search_queries ?? []) {
     if (entry?.enabled === false || typeof entry?.query !== 'string') continue;
     for (const hint of companyHintsFromQuery(entry.query, stopwords)) {
-      if (tracked.has(hint)) continue;
+      // The joined form only ("scale nova" → "scalenova"), so a tracked
+      // "ScaleNova" or "Scale-Nova" is recognised. Not every candidate: those
+      // include the first word, and a tracked "Scale" would then hide an
+      // untracked "Scale Nova" — the miss this report exists to surface.
+      const [joined] = deriveSlugCandidates(hint);
+      if (tracked.has(hint) || (joined && tracked.has(joined))) continue;
       if (!byHint.has(hint)) byHint.set(hint, new Set());
       byHint.get(hint).add(String(entry.name ?? '(unnamed)'));
     }
@@ -429,7 +494,7 @@ export function classifyFetchError(err) {
 export async function probeSlug(
   ats,
   slug,
-  { fetchJson = defaultFetchJson, eu = false } = {},
+  { fetchJson = probeFetchJson, eu = false } = {},
 ) {
   const spec = ATS[ats];
   if (!spec)
@@ -604,6 +669,21 @@ async function ownerConfirmed(ats, slug, companyName, { fetchJson, fetchText, eu
 }
 
 /**
+ * Strip control characters from text before it reaches a terminal.
+ *
+ * Owner names come from a remote board page's ``<title>``, so a hostile or
+ * merely broken board can put ANSI escapes in our CLI output. Escape sequences
+ * can recolour or rewrite prior lines, which is a misleading report rather than
+ * a cosmetic problem: this command's whole job is telling an operator what is
+ * live. Tab and newline are dropped too, since the row is one line.
+ */
+function sanitizeForTerminal(text) {
+  if (typeof text !== 'string') return '';
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 120).trim();
+}
+
+/**
  * Probe slug variants across all ATSes; prefer live boards over empty ones.
  *
  * No first-word suffix variants (#2937). Nothing downstream re-checks identity:
@@ -615,6 +695,12 @@ async function ownerConfirmed(ats, slug, companyName, { fetchJson, fetchText, eu
  */
 async function discoverAlternates(name, { fetchJson, fetchText }) {
   let bestEmpty = null;
+  // A live board whose identity could not be confirmed is NOT a suggestion: it is
+  // never adopted, and `fix-slugs` still refuses to write it. It is worth
+  // reporting all the same, because "your slug 404s and there is a live board at
+  // ashby/<slug> owned by someone else" and "your slug 404s and nothing answers"
+  // are different facts about a company and the summary showed neither (#4230).
+  let bestRejected = null;
   // One owner lookup per (ats, eu, slug) per company, so the added identity check
   // cannot multiply requests when candidates repeat across the probe order.
   const cache = new Map();
@@ -628,13 +714,24 @@ async function discoverAlternates(name, { fetchJson, fetchText }) {
         const r = await probeSlug(ats, slug, { fetchJson, eu });
         if (r.status !== 'live' && r.status !== 'empty') continue;
         const owner = await ownerConfirmed(ats, slug, name, { fetchJson, fetchText, eu, cache });
-        if (!owner.ok) continue;
+        if (!owner.ok) {
+          // Only a live board is worth reporting. An empty unconfirmed board says
+          // nothing the operator can act on, and `!bestRejected` keeps the first
+          // (widest-derived) candidate rather than the last one probed.
+          if (r.status === 'live' && !bestRejected) {
+            bestRejected = { ...r, ownerReason: owner.reason, ownerBoardName: owner.boardName || '' };
+          }
+          continue;
+        }
         if (r.status === 'live') return r;
         if (!bestEmpty) bestEmpty = r;
       }
     }
   }
-  return bestEmpty;
+  // The winner still wins; the rejection rides along so the caller can report it
+  // without the gate moving.
+  if (bestEmpty) return { ...bestEmpty, rejectedAlternate: bestRejected };
+  if (bestRejected) return { rejectedAlternate: bestRejected };
 }
 
 /**
@@ -747,7 +844,7 @@ export async function probeProvider(entry, provider, baseCtx) {
  */
 export async function verifyCompanies(
   companies,
-  { fetchJson = defaultFetchJson, fetchText = defaultFetchText, providers = null, httpCtx = null } = {},
+  { fetchJson = probeFetchJson, fetchText = probeFetchText, providers = null, httpCtx = null } = {},
 ) {
   const list = Array.isArray(companies) ? companies : [];
   const results = [];
@@ -757,7 +854,12 @@ export async function verifyCompanies(
     const name = typeof company.name === 'string' ? company.name : '(unnamed)';
     const match =
       parseAtsSlug(company.api) || parseAtsSlug(company.careers_url);
-    if (match) {
+    // An Ashby entry that opts into the embed source (`ashby: { embed: true }`)
+    // is one whose posting API is disabled. Tier 1 probes exactly that API, so
+    // it would report a live board as a wrong slug; the provider layer below
+    // reads the embed page instead.
+    const embedOnly = match?.ats === 'ashby' && /** @type {any} */ (company).ashby?.embed === true;
+    if (match && !embedOnly) {
       const probe = await probeSlug(match.ats, match.slug, { fetchJson, eu: match.eu });
       if (probe.status === 'live' || probe.status === 'empty') {
         results.push({ name, ...probe });
@@ -806,10 +908,10 @@ export async function verifyCompanies(
  */
 export async function verifyPortalsFile(
   filePath,
-  { fetchJson = defaultFetchJson, providers = null, httpCtx = null } = {},
+  { fetchJson = probeFetchJson, providers = null, httpCtx = null } = {},
 ) {
   if (!existsSync(filePath)) return { found: false, results: [] };
-  const config = yaml.load(readFileSync(filePath, 'utf-8'));
+  const config = loadYaml(readFileSync(filePath, 'utf-8'));
   // tracked_companies and job_boards carry the same entry shape and both feed the
   // scanner, so sweep both — a job board going dark is exactly as worth surfacing
   // as a company board 404ing.
@@ -831,7 +933,7 @@ const ERROR_KIND_LABEL = {
   unknown: 'unresolved',
 };
 
-function printResults(results) {
+export function printResults(results) {
   for (const r of results) {
     const icon = ICON[r.status] || '?';
     // ATS rows carry ats/slug; provider-layer rows carry the provider id.
@@ -844,8 +946,26 @@ function printResults(results) {
     } else if (r.status === 'missing') {
       const kind = ERROR_KIND_LABEL[r.errorKind] || 'unresolved';
       detail = `${source} (${kind}) — ${r.reason || 'unresolved'}`;
-      if (r.suggested) {
+      // Only an *adoptable* suggestion gets the "try" line. A rejected-only
+      // result carries `rejectedAlternate` and no top-level ats/slug, so gating
+      // on `r.suggested` alone rendered `try undefined/undefined`.
+      if (r.suggested && r.suggested.ats && r.suggested.slug) {
         detail += ` → try ${r.suggested.ats}/${r.suggested.slug}`;
+      }
+      // A live alternate whose identity could not be confirmed is reported, never
+      // suggested: the operator learns the board exists and why it was refused,
+      // and `fix-slugs` still will not write it (#4230).
+      const rejected = r.suggested?.rejectedAlternate;
+      if (rejected) {
+        // The observed owner and the refusal reason are two different facts: the
+        // first is what the board calls itself, the second is why we would not
+        // adopt it. Printing one in place of the other told the operator
+        // "identity unconfirmed" even when the identity was confirmed and simply
+        // did not match.
+        const board = sanitizeForTerminal(rejected.ownerBoardName);
+        const reason = rejected.ownerReason || 'identity unconfirmed';
+        const who = board ? `owned by "${board}" — ${reason}` : reason;
+        detail += `; also found live ${rejected.ats}/${rejected.slug} ${who}`;
       }
     } else {
       detail = r.reason || '';
@@ -908,30 +1028,42 @@ async function runAdd(name, { fetchJson }) {
  * there a board here", and the ATS directories rate-limit hard enough that
  * exhaustively probing every variant of every hint would poison the run.
  *
- * @returns {Promise<{hint: string, sources: string[], hit: object|null}[]>}
+ * Only a 404/410 (`slug_gone`) is evidence that a slug has no board. Any other
+ * failure (429, network, auth, server, an unexpected body) leaves the question
+ * open, so a hint with no hit keeps the first such failure as `probeError`
+ * and is reported as unverified rather than as "no board".
+ *
+ * @returns {Promise<{hint: string, sources: string[], hit: object|null, probeError: object|null}[]>}
  */
 export async function findUnmined(cfg, { fetchJson = defaultFetchJson, onProgress } = {}) {
   const results = [];
   for (const { hint, sources } of unminedHints(cfg)) {
     let hit = null;
+    let probeError = null;
     outer: for (const slug of deriveSlugCandidates(hint)) {
       for (const ats of Object.keys(ATS)) {
-        const r = await probeSlug(ats, slug, { fetchJson });
-        if (r.status === 'live' || r.status === 'empty') { hit = r; break outer; }
+        // Lever is one registry key with an eu flag, so both instances are
+        // probed or an EU-only tenant reads as "no Lever board" (as in
+        // discoverAlternates).
+        for (const eu of ats === 'lever' ? [false, true] : [false]) {
+          const r = await probeSlug(ats, slug, { fetchJson, eu });
+          if (r.status === 'live' || r.status === 'empty') { hit = { ...r, eu }; break outer; }
+          if (r.errorKind !== 'slug_gone' && !probeError) probeError = r;
+        }
       }
     }
-    results.push({ hint, sources, hit });
+    results.push({ hint, sources, hit, probeError: hit ? null : probeError });
     onProgress?.({ hint, hit });
   }
   return results;
 }
 
-async function runUnmined(filePath, { fetchJson }) {
+export async function runUnmined(filePath, { fetchJson } = {}) {
   if (!existsSync(filePath)) {
     console.log(`verify-portals: no portals file at ${filePath} — nothing to check.`);
     return 0;
   }
-  const cfg = yaml.load(readFileSync(filePath, 'utf8')) || {};
+  const cfg = loadYaml(readFileSync(filePath, 'utf8')) || {};
   const hints = unminedHints(cfg);
   if (hints.length === 0) {
     console.log('No untracked companies named in search_queries. Nothing to mine.');
@@ -943,9 +1075,15 @@ async function runUnmined(filePath, { fetchJson }) {
   );
   const results = await findUnmined(cfg, { fetchJson });
   const found = results.filter((r) => r.hit);
+  const unverified = results.filter((r) => r.probeError);
 
   const probed = Object.keys(ATS).join('/');
-  for (const { hint, sources, hit } of results) {
+  for (const { hint, sources, hit, probeError } of results) {
+    if (probeError) {
+      const why = probeError.httpStatus ? `HTTP ${probeError.httpStatus}` : probeError.errorKind;
+      console.log(`  ⚠️  ${hint} — could not verify (${probeError.ats}/${probeError.slug}: ${why}); re-run later`);
+      continue;
+    }
     if (!hit) {
       // Deliberately not "no board": only the three slug-addressable ATSs are
       // probed. AMD and Apple genuinely do have boards — on Workday and their
@@ -954,7 +1092,7 @@ async function runUnmined(filePath, { fetchJson }) {
       continue;
     }
     const detail = hit.status === 'live' ? `${hit.jobCount} jobs` : 'live but empty';
-    console.log(`  ${ICON[hit.status]} ${hint} — ${hit.ats}/${hit.slug} (${detail})`);
+    console.log(`  ${ICON[hit.status]} ${hint} — ${hit.ats}${hit.eu ? ' (EU)' : ''}/${hit.slug} (${detail})`);
     console.log(`       named in: ${sources.join(', ')}`);
   }
 
@@ -963,41 +1101,85 @@ async function runUnmined(filePath, { fetchJson }) {
       `\n${found.length} of ${results.length} have a real board. A search_queries entry only ` +
         'produces links for a human;\nmove these to tracked_companies so the scanner actually reads them.',
     );
-  } else {
+  } else if (!unverified.length) {
     console.log('\nNo scannable boards behind these names — the search entries are earning their keep.');
   }
-  return found.length;
+  if (unverified.length) {
+    console.log(
+      `\n${unverified.length} of ${results.length} could not be checked, so they are not reported as having no board.`,
+    );
+  }
+  // Both count for --strict: an unverified name may still hide a board.
+  return found.length + unverified.length;
 }
+
+const KNOWN_FLAGS = ['--add', '--unmined', '--strict', '--file', '--help', '-h'];
+const VALUE_FLAGS = ['--add', '--file'];
+
+const USAGE = `Usage:
+  node verify-portals.mjs                 # sweep tracked_companies + job_boards in portals.yml
+  node verify-portals.mjs --add cursor    # probe slug variants for one name
+  node verify-portals.mjs --unmined       # companies named only in search_queries that have a Greenhouse/Ashby/Lever board
+  node verify-portals.mjs --strict        # exit non-zero if any slug is unresolved
+  node verify-portals.mjs --file <path>   # use a specific portals file
+  node verify-portals.mjs --help          # print this usage block and exit`;
 
 async function main() {
   const args = process.argv.slice(2);
-  const strict = args.includes('--strict');
-  const fetchJson = defaultFetchJson;
+  // Before any network work: an unrecognized flag exits 1, --help/-h prints
+  // USAGE and exits 0. Neither used to be checked at all (#4250) — --help
+  // fell through untouched and triggered the exact same full portals.yml
+  // sweep as no flags, which on a large config can run for minutes with zero
+  // output and reads exactly like a hang.
+  // requireOperand: without it, `--file --strict` reads --strict as the file
+  // path (flagValue() returns args[idx+1] unconditionally, with no check that
+  // it isn't itself another flag), and a bare `--file`/`--file=` reaches
+  // resolve('') — the current directory — which readFileSync() then rejects
+  // with a raw EISDIR instead of a usage error (CodeRabbit, #4254 review).
+  // Same shape already fixed the same way in process-quality.mjs, doctor.mjs,
+  // detect-reposts.mjs and others.
+  validateFlags(args, KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS, requireOperand: true });
 
-  const addFlag = args.indexOf('--add');
-  if (addFlag !== -1) {
-    await runAdd(args[addFlag + 1] || '', { fetchJson });
+  const strict = hasFlag(args, '--strict');
+  const fetchJson = probeFetchJson;
+
+  if (hasFlag(args, '--add')) {
+    await runAdd(flagValue(args, '--add') || '', { fetchJson });
     return;
   }
 
-  if (args.includes('--unmined')) {
-    const f = args.indexOf('--file');
-    const p = resolve(f === -1 ? DEFAULT_PORTALS_PATH : args[f + 1] || '');
-    const n = await runUnmined(p, { fetchJson });
+  // requireOperand above catches a bare `--file` (nothing follows),
+  // `--file --anotherflag` (the next token looks like a flag), and
+  // `--file=` (empty value in equals form, #5127). Keep this check as
+  // defense-in-depth so an empty path never reaches resolve('') the same way.
+  const fileArg = flagValue(args, '--file');
+  if (hasFlag(args, '--file') && !fileArg) {
+    console.error('Error: --file requires a value');
+    process.exit(1);
+  }
+
+  const filePath = resolve(
+    hasFlag(args, '--file') ? fileArg : DEFAULT_PORTALS_PATH,
+  );
+
+  if (hasFlag(args, '--unmined')) {
+    const n = await runUnmined(filePath, { fetchJson });
     // --strict makes this a CI gate: an unmined board is a silent coverage hole.
     if (strict && n > 0) process.exit(1);
     return;
   }
 
-  const fileFlag = args.indexOf('--file');
-  const filePath = resolve(
-    fileFlag === -1 ? DEFAULT_PORTALS_PATH : args[fileFlag + 1] || '',
-  );
-
   // Load the scanner's provider plugins so non-ATS boards (Workday,
   // SuccessFactors, SmartRecruiters, …) get a real reachability probe instead
   // of an un-actionable "skipped".
   const providers = await loadProviders(PROVIDERS_DIR);
+  // Fold in enabled keyed/auth-gated provider plugins, exactly as scan.mjs does
+  // — without this the verifier resolves only providers/*.mjs and disagrees
+  // with the scanner on every plugin-provider entry (#4026). No-op for a
+  // plugin-free install (mergeProviderPlugins returns before config/plugins.yml
+  // is read when it is absent).
+  const { mergeProviderPlugins } = await import('./plugins/_engine.mjs');
+  await mergeProviderPlugins(providers, { root: dirname(PROVIDERS_DIR), dataRoot: DATA_ROOT });
   const httpCtx = makeHttpCtx();
   const { found, results } = await verifyPortalsFile(filePath, { fetchJson, providers, httpCtx });
   if (!found) {

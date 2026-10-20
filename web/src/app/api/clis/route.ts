@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
-import { detectClis } from "@/lib/clis";
 import { careerOpsRoot } from "@/lib/career-ops";
+import { detectClis } from "@/lib/clis";
+import { readRememberedCli } from "@/lib/remembered-cli.mjs";
 
 export const dynamic = "force-dynamic";
 
@@ -13,5 +14,5 @@ export const dynamic = "force-dynamic";
 // models` takes seconds and codex's list is only readable from a file it
 // maintains itself.
 export async function GET() {
-  return NextResponse.json({ clis: detectClis(careerOpsRoot()) });
+  return NextResponse.json({ clis: detectClis(careerOpsRoot()), remembered: readRememberedCli(careerOpsRoot()) });
 }

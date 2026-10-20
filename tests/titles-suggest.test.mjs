@@ -64,8 +64,10 @@ function checkout({ portals = PORTALS, corpus = true } = {}) {
   writeFileSync(join(dir, 'cv.md'), CV);
   if (portals) writeFileSync(join(dir, 'portals.yml'), portals);
   if (corpus) {
-    writeFileSync(join(dir, 'data', 'scan-history.tsv'), 'url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n' + ADMITTED.map((t, i) => `https://x/${i}\t2026-01-01\tp\t${t}\tAcme\tadded`).join('\n') + '\n');
-    writeFileSync(join(dir, 'data', 'scan-rejects.tsv'), 'title\tcompany\tsource\tlast_seen\ttimes_seen\n' + REJECTED.map((t) => `${t}\tAcme\tp\t2026-01-01\t1`).join('\n') + '\n');
+    // Rejected titles are skipped_title rows in the same file, as scan.mjs writes them.
+    writeFileSync(join(dir, 'data', 'scan-history.tsv'), 'url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n'
+      + ADMITTED.map((t, i) => `https://x/${i}\t2026-01-01\tp\t${t}\tAcme\tadded`).join('\n') + '\n'
+      + REJECTED.map((t, i) => `https://y/${i}\t2026-01-01\tp\t${t}\tAcme\tskipped_title`).join('\n') + '\n');
   }
   return dir;
 }

@@ -15,7 +15,7 @@
  *
  * The model is not trusted on assertion. Every keyword is replayed with the
  * scanner's own matcher over data/scan-history.tsv (admitted) and
- * data/scan-rejects.tsv (rejected) — see lib/keyword-replay.mjs — and the
+ * its skipped_title rows (rejected) — see lib/keyword-replay.mjs — and the
  * report shows, per keyword, how many titles it admits, how many only it
  * admits, and how many were previously rejected. Determinism comes from that
  * replay, not from the generator: two runs may propose differently, but the
@@ -44,7 +44,7 @@ import { fileURLToPath } from 'node:url';
 import * as yaml from 'js-yaml';
 import { getCareerOpsRoot } from './path-resolver.mjs';
 import { validateFlags } from './lib/cli-flags.mjs';
-import { pickCli, askAgent } from './lib/agent-cli.mjs';
+import { pickCli, askAgent } from './lib/agent-run.mjs';
 import { loadCorpus, replayProposal, keywordStats } from './lib/keyword-replay.mjs';
 import { replaceListBlock, appendToListBlock, scaffoldPortals, TEMPLATE_REL } from './lib/portals-blocks.mjs';
 

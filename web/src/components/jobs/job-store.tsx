@@ -1,27 +1,26 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { scoreTone } from "@/lib/format";
-import { CONFIG_KEY, readSavedCliId, resolveCliId } from "@/lib/saved-cli";
+import { CONFIG_KEY, resolveCliId } from "@/lib/saved-cli";
 
-// `detail` is the tool's argument (file read, command run, query searched).
-// Optional: a CLI may not ship one, and an unrecognised argument shape yields none.
-export type JobStep = { kind: "tool" | "status"; label: string; detail?: string; ts: number };
+// Model/effort are keyed by CLI in Config: "xhigh" is valid on claude and codex
+// but not grok, and a model name means nothing to another vendor.
+function cliTuning(cliId: string): { model?: string; effort?: string } {
+  try {
+    const raw = localStorage.getItem(CONFIG_KEY);
+    const cfg = raw ? JSON.parse(raw) : null;
+    return { model: cfg?.models?.[cliId] || undefined, effort: cfg?.efforts?.[cliId] || undefined };
+  } catch {
+    return {}; // unreadable config: run with the CLI's defaults
+  }
+}
+import { createWorkerFeedback } from "@/lib/worker-feedback.mjs";
+import { readJobStream } from "@/lib/job-stream.mjs";
+import { createJobsPersister } from "@/lib/jobs-persist.mjs";
+
+export type JobStep = { kind: "tool" | "status"; label: string; ts: number };
 export type JobResult = { score: number | null; summary: string; tone: "good" | "warn" | "bad" | "muted" };
-
-/**
- * The report's own `## Machine Summary` — structured, not prose. Parsed
- * server-side when the run finishes, so it reaches a client that was away for
- * the whole thing. This is what a finished evaluation should show; the text
- * stream only ever carried the agent's inter-tool narration.
- */
-export type JobTldr = {
-  company?: string; role?: string; score?: number; archetype?: string;
-  final_decision?: string; legitimacy_tier?: string; work_auth?: string;
-  risk_level?: string; confidence?: string; next_action?: string;
-  hard_stops?: string[]; soft_gaps?: string[]; top_strengths?: string[];
-  report?: string;
-};
 
 export type Job = {
   id: string;
@@ -36,12 +35,12 @@ export type Job = {
   text: string;
   result?: JobResult;
   cost?: { tokens: number; usd?: number }; // per-run token cost (Claude result event) — local only
+  reportN?: number | null;
   startedAt: number;
   endedAt?: number;
-  tldr?: JobTldr;
 };
 
-type StartOpts = { title: string; subtitle?: string; kind: string; input: string; page?: string; batchId?: string };
+type StartOpts = { title: string; subtitle?: string; kind: string; input: string; page?: string; batchId?: string; brief?: Record<string, string> };
 
 type Ctx = {
   jobs: Job[];
@@ -75,6 +74,13 @@ function parseVerdict(text: string): JobResult {
 
 export function JobsProvider({ children }: { children: React.ReactNode }) {
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [announcement, setAnnouncement] = useState("");
+  const feedback = useRef<ReturnType<typeof createWorkerFeedback> | null>(null);
+  useEffect(() => {
+    const owner = createWorkerFeedback(setAnnouncement);
+    feedback.current = owner;
+    return () => { owner.dispose(); feedback.current = null; };
+  }, []);
   const seq = useRef(0);
   const loaded = useRef(false);
 
@@ -84,12 +90,8 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
       const raw = localStorage.getItem(JOBS_KEY);
       const arr = raw ? JSON.parse(raw) : null;
       if (Array.isArray(arr)) {
-        // A "running" job from a previous session is no longer presumed dead.
-        // The server owns runs now, so a reload — or a phone that locked and
-        // came back — may well be rejoining work that is still going. Keep the
-        // optimistic state and let the reconcile effect below settle it against
-        // the server, which is the only thing that actually knows.
-        setJobs(arr as Job[]);
+        // anything left "running" from a previous session is stale → mark interrupted
+        setJobs(arr.map((j: Job) => (j.status === "running" ? { ...j, status: "error", steps: [...(j.steps || []), { kind: "status", label: "Interrupted (page reloaded)", ts: Date.now() }] } : j)));
       }
     } catch {
       /* ignore */
@@ -97,97 +99,39 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
     loaded.current = true;
   }, []);
 
-  // persist
+  // persist. Every streamed chunk replaces `jobs`, so writes go through the
+  // persister: at once when nothing runs, at most once a second while a job
+  // streams, and flushed when the page is hidden or the provider unmounts.
+  const persister = useRef<ReturnType<typeof createJobsPersister<Job>> | null>(null);
+  if (persister.current === null) {
+    persister.current = createJobsPersister<Job>({
+      write: (list) => {
+        try {
+          localStorage.setItem(JOBS_KEY, JSON.stringify(list.slice(0, 40)));
+        } catch {
+          /* quota */
+        }
+      },
+      isActive: (list) => list.some((j) => j.status === "running"),
+    });
+  }
+  useEffect(() => {
+    const owner = persister.current;
+    const flush = () => owner?.flush();
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
+    };
+  }, []);
   useEffect(() => {
     if (!loaded.current) return;
-    try {
-      localStorage.setItem(JOBS_KEY, JSON.stringify(jobs.slice(0, 40)));
-    } catch {
-      /* quota */
-    }
+    persister.current?.save(jobs);
   }, [jobs]);
 
   const patch = useCallback((id: string, fn: (j: Job) => Job) => {
     setJobs((js) => js.map((j) => (j.id === id ? fn(j) : j)));
   }, []);
-
-  // Reconcile with the server: adopt runs this browser has never seen (started
-  // from the Mac, or from this phone before its localStorage was cleared) and
-  // settle anything we still think is running. Polls only while something is in
-  // flight, so an idle dashboard is silent.
-  // Rebuild a job's step trace and text from the durable transcript. Used when
-  // a run completed (or started) without this client attached: the server has
-  // the whole story, the browser has a stub.
-  const hydrate = useCallback(async (id: string) => {
-    try {
-      const r = await fetch(`/api/jobs/${id}/events?from=0`, { cache: "no-store" });
-      if (!r.ok) return;
-      const { events } = (await r.json()) as { events: Array<{ type?: string; name?: string; detail?: string; label?: string; text?: string }> };
-      const steps: JobStep[] = [];
-      let text = "";
-      for (const ev of events) {
-        if (ev.type === "tool") steps.push({ kind: "tool", label: ev.name!, detail: ev.detail, ts: Date.now() });
-        else if (ev.type === "status") steps.push({ kind: "status", label: ev.label!, ts: Date.now() });
-        else if (ev.type === "text") text = (text + ev.text).slice(-8000);
-      }
-      if (steps.length === 0 && !text) return;
-      setJobs((js) => js.map((j) => (j.id === id ? { ...j, steps: steps.length ? steps : j.steps, text: text || j.text } : j)));
-    } catch {
-      /* offline — the record on disk is unaffected, next open will hydrate */
-    }
-  }, []);
-
-  useEffect(() => {
-    let stop = false;
-    const tick = async () => {
-      let serverJobs: Array<{ id: string; kind: string; input: string; title?: string; status: string; startedAt: number; summary?: string; tldr?: JobTldr }>;
-      try {
-        const r = await fetch("/api/jobs", { cache: "no-store" });
-        if (!r.ok) return;
-        ({ jobs: serverJobs } = await r.json());
-      } catch {
-        return; // offline; the run is unaffected, try again next tick
-      }
-      setJobs((js) => {
-        const byId = new Map(js.map((j) => [j.id, j]));
-        let changed = false;
-        for (const sj of serverJobs) {
-          const local = byId.get(sj.id);
-          if (!local) {
-            // Only adopt live work. Back-filling every historical run would
-            // bury the local list under runs the user already dealt with.
-            if (sj.status !== "running") continue;
-            byId.set(sj.id, {
-              id: sj.id, title: sj.title || sj.kind, subtitle: sj.input, page: "/", input: sj.input,
-              kind: sj.kind as Job["kind"], status: "running",
-              steps: [{ kind: "status", label: "Rejoined — started elsewhere", ts: Date.now() }],
-              text: "", startedAt: sj.startedAt,
-            } as Job);
-            void hydrate(sj.id);
-            changed = true;
-          } else if (local.status === "running" && sj.status !== "running") {
-            byId.set(sj.id, { ...local, status: sj.status === "error" ? "error" : "done", endedAt: Date.now(), tldr: sj.tldr ?? local.tldr,
-              steps: [...local.steps, { kind: "status", label: sj.summary || "Finished", ts: Date.now() }] });
-            // Settled while we were away, so this client never saw the tool
-            // trace — 35 events in the log against two on screen. Replay it
-            // once, here, rather than on every tick.
-            void hydrate(sj.id);
-            changed = true;
-          } else if (sj.tldr && !local.tldr) {
-            // The client finished the stream itself, so the branch above never
-            // fired; the verdict still has to arrive from the server, which is
-            // the only side that parses the report.
-            byId.set(sj.id, { ...local, tldr: sj.tldr });
-            changed = true;
-          }
-        }
-        return changed ? [...byId.values()].sort((a, b) => b.startedAt - a.startedAt) : js;
-      });
-    };
-    void tick();
-    const iv = setInterval(() => { if (!stop) void tick(); }, 5000);
-    return () => { stop = true; clearInterval(iv); };
-  }, [hydrate]);
 
   const startJob = useCallback(
     (opts: StartOpts): string | null => {
@@ -207,9 +151,26 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
       };
       setJobs((js) => [job, ...js]);
 
+      // Declared before resolveCliId() so its stale-CLI notice lands in the log
+      // sent to /api/runs/save, not only in the live job.
+      const steps: JobStep[] = [];
       (async () => {
-        const cliId = readSavedCliId() || (await resolveCliId());
+        // resolveCliId() validates the saved id against what is installed; a
+        // bare readSavedCliId() here would short-circuit that check and launch
+        // a run against an uninstalled CLI (#4012).
+        // A stale saved id is replaced silently otherwise — name the switch in
+        // the job log so a transient "not installed" can't rewrite the user's
+        // choice without a record.
+        const cliId = await resolveCliId((stale, replacement) => {
+          const label = replacement
+            ? `Saved CLI '${stale}' is not installed — using '${replacement}'`
+            : `Saved CLI '${stale}' is not installed`;
+          const step: JobStep = { kind: "status", label, ts: Date.now() };
+          steps.push(step);
+          patch(id, (j) => ({ ...j, steps: [...j.steps, step] }));
+        });
         if (!cliId) {
+          feedback.current?.push({ ...job, status: "error" });
           patch(id, (j) => ({
             ...j,
             status: "error",
@@ -218,24 +179,16 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
           }));
           return;
         }
-        // Model/effort are keyed by CLI in Config: "xhigh" is valid on claude and
-        // codex but not grok, and a model name means nothing to another vendor.
-        let model: string | undefined;
-        let effort: string | undefined;
-        try {
-          const raw = localStorage.getItem(CONFIG_KEY);
-          const cfg = raw ? JSON.parse(raw) : null;
-          model = cfg?.models?.[cliId] || undefined;
-          effort = cfg?.efforts?.[cliId] || undefined;
-        } catch {
-          /* unreadable config: run with the CLI's defaults */
-        }
         let text = "";
         let verdictLine = ""; // latched separately so the 8000-char tail can't drop it
         let doneTokens = 0; // per-run token cost, forwarded on the done event (#6)
         let doneCostUsd: number | null = null;
-        const steps: JobStep[] = [];
+        let doneReportN: number | null = null;
+        let finished = false;
         const finish = (status: "done" | "error", lastLabel?: string) => {
+          if (finished) return;
+          finished = true;
+          feedback.current?.push({ ...job, status });
           const result = status === "done" ? parseVerdict(verdictLine || text) : undefined;
           const cost = status === "done" && doneTokens > 0 ? { tokens: doneTokens, usd: doneCostUsd ?? undefined } : undefined;
           patch(id, (j) => ({
@@ -243,6 +196,7 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
             status,
             result,
             cost,
+            reportN: doneReportN,
             endedAt: Date.now(),
             steps: lastLabel ? [...j.steps, { kind: "status", label: lastLabel, ts: Date.now() }] : j.steps,
           }));
@@ -261,104 +215,42 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
           }
         };
 
-        // Events arrive twice over: live from the POST stream while a reader is
-        // attached, and from the durable transcript on reconnect. One handler
-        // for both, and `seen` counts what we have consumed — the server appends
-        // every event to the log before enqueuing it, so that count IS the line
-        // offset to resume from.
-        let seen = 0;
-        let terminal: "done" | "error" | null = null;
-        let terminalMsg = "";
-        const applyEvent = (ev: { type?: string; name?: string; detail?: string; label?: string; text?: string; tokens?: number; costUsd?: number; msg?: string }) => {
-          seen++;
-          if (ev.type === "tool") {
-            const step: JobStep = { kind: "tool", label: ev.name!, detail: ev.detail, ts: Date.now() };
-            steps.push(step);
-            patch(id, (j) => ({ ...j, steps: [...j.steps, step] }));
-          } else if (ev.type === "status") {
-            steps.push({ kind: "status", label: ev.label!, ts: Date.now() });
-            patch(id, (j) => ({ ...j, steps: [...j.steps, { kind: "status", label: ev.label!, ts: Date.now() }] }));
-          } else if (ev.type === "text") {
-            const full = text + ev.text;
-            const vm = full.match(/VERDICT:[^\n]*/i);
-            if (vm) verdictLine = vm[0];
-            text = full.slice(-8000);
-            patch(id, (j) => ({ ...j, text }));
-          } else if (ev.type === "done") {
-            if (typeof ev.tokens === "number") doneTokens = ev.tokens;
-            if (typeof ev.costUsd === "number") doneCostUsd = ev.costUsd;
-            terminal = "done";
-          } else if (ev.type === "error") {
-            terminal = "error";
-            terminalMsg = ev.msg || "Error";
-          }
-        };
-
-        // Poll the durable transcript until the server marks the run finished.
-        // Deliberately polling, not a second stream: the bug being fixed is that
-        // held connections die, so the recovery path must not need one to live.
-        const drainFromLog = async () => {
-          for (;;) {
-            let payload: { events?: unknown[]; nextLine?: number; running?: boolean; job?: { status?: string; summary?: string } };
-            try {
-              const r = await fetch(`/api/jobs/${id}/events?from=${seen}`, { cache: "no-store" });
-              if (!r.ok) { finish("error", "Lost track of this run"); return; }
-              payload = await r.json();
-            } catch {
-              // Still offline — back off and keep trying rather than declaring
-              // failure; the run on the Mac is unaffected either way.
-              await new Promise((r) => setTimeout(r, 3000));
-              continue;
-            }
-            for (const ev of payload.events ?? []) applyEvent(ev as Parameters<typeof applyEvent>[0]);
-            if (terminal) { finish(terminal, terminal === "done" ? "Done" : terminalMsg); return; }
-            if (!payload.running) {
-              const st = payload.job?.status === "error" ? "error" : "done";
-              finish(st, payload.job?.summary || (st === "done" ? "Done" : "Ended"));
-              return;
-            }
-            await new Promise((r) => setTimeout(r, 1500));
-          }
-        };
-
         try {
           const res = await fetch("/api/run", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            // Hand the server our id so the transcript is addressable the moment
-            // the run starts — without it a client that dies early could never
-            // find its own job again.
-            body: JSON.stringify({ kind: opts.kind, input: opts.input, cliId, jobId: id, model, effort }),
+            body: JSON.stringify({ kind: opts.kind, input: opts.input, cliId, brief: opts.brief, ...cliTuning(cliId) }),
           });
           if (!res.ok || !res.body) {
             const e = await res.json().catch(() => ({}));
             finish("error", e.error || "Failed to start");
             return;
           }
-          const reader = res.body.getReader();
-          const dec = new TextDecoder();
-          let buf = "";
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buf += dec.decode(value, { stream: true });
-            let nl: number;
-            while ((nl = buf.indexOf("\n")) !== -1) {
-              const line = buf.slice(0, nl).trim();
-              buf = buf.slice(nl + 1);
-              if (!line) continue;
-              try { applyEvent(JSON.parse(line)); } catch { /* partial */ }
+          const completion = await readJobStream(res.body, (ev) => {
+            if (ev.type === "tool") {
+              steps.push({ kind: "tool", label: ev.name, ts: Date.now() });
+              patch(id, (j) => ({ ...j, steps: [...j.steps, { kind: "tool", label: ev.name, ts: Date.now() }] }));
+            } else if (ev.type === "status") {
+              steps.push({ kind: "status", label: ev.label, ts: Date.now() });
+              patch(id, (j) => ({ ...j, steps: [...j.steps, { kind: "status", label: ev.label, ts: Date.now() }] }));
+            } else if (ev.type === "text") {
+              const full = text + ev.text;
+              const vm = full.match(/VERDICT:[^\n]*/i);
+              if (vm) verdictLine = vm[0];
+              text = full.slice(-8000);
+              patch(id, (j) => ({ ...j, text }));
             }
-            if (terminal === "error") { finish("error", terminalMsg); return; }
+          });
+          if (completion.status === "error") {
+            finish("error", completion.message);
+            return;
           }
-          if (terminal) { finish(terminal, terminal === "done" ? "Done" : terminalMsg); return; }
-          // Stream ended with no verdict — the reader was cut off, not the run.
-          // The work is still going on the Mac; pick it back up from the log.
-          await drainFromLog();
+          doneTokens = completion.tokens ?? 0;
+          doneCostUsd = completion.costUsd ?? null;
+          doneReportN = typeof completion.reportN === "number" ? completion.reportN : null;
+          finish("done", "Done");
         } catch {
-          // Network dropped mid-stream (screen lock, app switch, Wi-Fi change).
-          // Same story: reattach instead of reporting a failure that did not happen.
-          await drainFromLog();
+          finish("error", "Connection error");
         }
       })();
 
@@ -370,5 +262,14 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
   const removeJob = useCallback((id: string) => setJobs((js) => js.filter((j) => j.id !== id)), []);
   const clearFinished = useCallback(() => setJobs((js) => js.filter((j) => j.status === "running")), []);
 
-  return <JobsContext.Provider value={{ jobs, startJob, removeJob, clearFinished }}>{children}</JobsContext.Provider>;
+  // A new object only when the list or an action changes, not on every render
+  // of this provider (the screen-reader announcement re-renders it too).
+  const value = useMemo(() => ({ jobs, startJob, removeJob, clearFinished }), [jobs, startJob, removeJob, clearFinished]);
+
+  return (
+    <JobsContext.Provider value={value}>
+      {children}
+      <div role="status" aria-label="Worker task status" aria-live="polite" aria-atomic="true" className="sr-only">{announcement}</div>
+    </JobsContext.Provider>
+  );
 }

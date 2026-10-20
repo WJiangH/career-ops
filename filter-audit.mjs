@@ -8,14 +8,17 @@
  * nothing about how. scan.mjs already computes which keywords matched a title —
  * matchedTitleKeywords() — but only to scope content_filter, and throws the
  * answer away 8,000 times per scan. This replays it over the offers that
- * survived, so the filter can be tuned from evidence instead of guesswork.
+ * passed the title filter, so the filter can be tuned from evidence instead of
+ * guesswork.
  *
- * Three questions, two of which it can answer today:
+ * Three questions, two of which it answers:
  *
  *   1. Which keywords earn their keep?  — replayed over scan-history.tsv
  *   2. Which generate noise?           — joined against evaluated scores
- *   3. What am I missing?              — needs rejected titles, which the
- *                                        scanner does not record. See --help.
+ *   3. What am I missing?              — not here. The rejected titles are now
+ *                                        in scan-history.tsv as skipped_title
+ *                                        (#2695); a near-miss report over them
+ *                                        is a separate tool.
  *
  * The metric that matters is `unique`, not `hits`: how many offers a keyword is
  * the ONLY one to catch. A keyword with 200 hits and 0 unique can be deleted
@@ -23,66 +26,131 @@
  * reason those three were ever seen.
  *
  * Usage:
- *   node filter-audit.mjs
- *   node filter-audit.mjs --summary
- *   node filter-audit.mjs --self-test
+ *   node filter-audit.mjs             JSON
+ *   node filter-audit.mjs --summary   human-readable
  */
 
-import { readFileSync, existsSync, readdirSync } from 'fs';
+import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
+import { loadYaml } from './lib/yaml-document.mjs';
+import { matchedTitleKeywords, normalizeUrlForDedup, PORTALS_PATH, SCAN_HISTORY_PATH } from './scan.mjs';
+import { foldTitle } from './title-keywords.mjs';
+import { parseScanHistoryLine } from './lib/scan-history-columns.mjs';
+import { parseScore, unwrapReportUrlToken } from './tracker-parse.mjs';
 import { getCareerOpsRoot } from './path-resolver.mjs';
-import * as yaml from 'js-yaml';
-import { matchedTitleKeywords } from './scan.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { validateFlags } from './lib/cli-flags.mjs';
 
-// User-layer files (cv.md, portals.yml, data/, reports/) live under the data
-// root, which CAREER_OPS_ROOT may point away from the codebase.
-const USER_ROOT = getCareerOpsRoot();
-const PORTALS = join(USER_ROOT, 'portals.yml');
-const HISTORY = join(USER_ROOT, 'data', 'scan-history.tsv');
-const REPORTS = join(USER_ROOT, 'reports');
+const REPORTS_DIR = join(getCareerOpsRoot(), 'reports');
 
-/** scan-history.tsv rows. Positional by header — trailing columns are appended
- *  over time and older rows legitimately have fewer (see DATA_CONTRACT.md). */
+const KNOWN_FLAGS = ['--summary', '--help', '-h'];
+const USAGE = `filter-audit.mjs — what your title_filter is actually doing
+
+  node filter-audit.mjs             JSON
+  node filter-audit.mjs --summary   human-readable
+
+Answers "which keywords earn their keep" and "which generate noise" by
+replaying the matcher over the offers in data/scan-history.tsv that passed the
+title filter.
+
+"What am I missing" is not answered here. The titles the filter rejected are
+recorded as skipped_title rows (#2695) and are left out of this replay, since
+by definition they match no positive keyword.`;
+
+/**
+ * The offers that passed the title filter, one per posting.
+ *
+ * `skipped_title` rows are left out: they matched no positive keyword by
+ * definition, so replaying them would only inflate `unmatchedRows`, which is
+ * meant to say the filter changed since a row was recorded. Every other status
+ * was decided after the title cut. A posting can carry several rows (one per
+ * status), so rows are deduped on the scanner's own URL key.
+ *
+ * Pre-v1.18 rows carry three cells, url / date / title, with no header, and an
+ * upgrade keeps them byte-identical. Read by the current column order their
+ * title lands in `portal`, so a three-cell row takes its title from there and
+ * has no company or status.
+ */
 export function readHistory(tsv) {
-  const lines = tsv.split('\n').filter((l) => l.trim());
-  if (lines.length < 2) return [];
-  const head = lines[0].split('\t');
-  const iUrl = head.indexOf('url');
-  const iTitle = head.indexOf('title');
-  const iCompany = head.indexOf('company');
-  if (iTitle === -1) return [];
-  return lines.slice(1).map((l) => {
-    const c = l.split('\t');
-    return { url: c[iUrl] ?? '', title: c[iTitle] ?? '', company: c[iCompany] ?? '' };
-  }).filter((r) => r.title);
+  const lines = String(tsv ?? '').split('\n');
+  if (lines[0]?.startsWith('url\t')) lines.shift();
+  const seen = new Set();
+  const rows = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const parsed = parseScanHistoryLine(line);
+    const legacy = line.split('\t').length === 3;
+    const { url } = parsed;
+    const title = legacy ? parsed.portal : parsed.title;
+    const company = legacy ? '' : parsed.company;
+    const status = legacy ? '' : parsed.status;
+    if (!title || status === 'skipped_title') continue;
+    const key = url ? normalizeUrlForDedup(url) : `title:${title}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ url, title, company });
+  }
+  return rows;
 }
 
-/** url → score, from the evaluation reports. Lets a keyword be judged on the
- *  quality of what it admits, not just the quantity. */
-export function readScoresByUrl(reportTexts) {
+/** Leading report number of `041-acme-2026-01-07.md`, or -1. */
+function reportNumber(name) {
+  const m = String(name).match(/^(\d+)-/);
+  return m ? Number(m[1]) : -1;
+}
+
+/**
+ * URL → score, from the evaluation reports. Lets a keyword be judged on the
+ * quality of what it admits, not just the quantity.
+ *
+ * A posting evaluated twice has two reports. The highest report number wins,
+ * since that is the latest evaluation; reports are read in that order rather
+ * than directory order, so the result is the same on every filesystem.
+ *
+ * @param {{name: string, text: string}[]} reports
+ */
+export function readScoresByUrl(reports) {
   const map = new Map();
-  for (const text of reportTexts) {
-    const u = text.match(/\*\*URL:\*\*\s*<?([^\s>\n)]+)/);
-    const s = text.match(/\*\*Score:\*\*\s*([0-9](?:\.[0-9])?)/);
-    if (u && s) map.set(u[1].replace(/[)\s]+$/, ''), Number(s[1]));
+  const ordered = [...reports].sort((a, b) => reportNumber(a.name) - reportNumber(b.name) || a.name.localeCompare(b.name));
+  for (const { text } of ordered) {
+    const u = text.match(/\*\*URL:\*\*[ \t]*(\S+)/);
+    const s = text.match(/\*\*Score:\*\*[ \t]*([^\n]+)/);
+    if (!u || !s) continue;
+    const score = parseScore(s[1]);
+    if (score > 0) map.set(normalizeUrlForDedup(unwrapReportUrlToken(u[1])), score);
   }
   return map;
 }
 
 export function audit(titleFilter, history, scoresByUrl) {
-  const positives = Array.isArray(titleFilter?.positive) ? titleFilter.positive : [];
+  // Keywords that compile to the same matcher are one keyword. matchedTitleKeywords
+  // returns one hit per entry, so a duplicate ("AI" twice, or "AI" and "ai")
+  // gave one title two hits, zeroed `unique` for both and called a load-bearing
+  // keyword redundant. The first spelling is kept; the rest are reported.
+  const raw = Array.isArray(titleFilter?.positive) ? titleFilter.positive : [];
+  const byKey = new Map();
+  const duplicates = [];
+  for (const k of raw) {
+    if (typeof k !== 'string' || !k.trim()) continue;
+    const key = foldTitle(k).trim();
+    if (byKey.has(key)) duplicates.push(k);
+    else byKey.set(key, k);
+  }
+  const positives = [...byKey.values()];
+  const filter = { ...titleFilter, positive: positives };
+
   const stats = new Map(positives.map((k) => [k, { keyword: k, hits: 0, unique: 0, scored: 0, scoreSum: 0, examples: [] }]));
   let unmatched = 0;
 
   for (const row of history) {
-    const hit = matchedTitleKeywords(row.title, titleFilter);
+    const hit = matchedTitleKeywords(row.title, filter);
     if (hit.length === 0) {
       // Present in history but matched nothing: the filter changed since this
       // row was recorded. Worth surfacing rather than silently dropping.
       unmatched++;
       continue;
     }
-    const score = scoresByUrl.get(row.url);
+    const score = row.url ? scoresByUrl.get(normalizeUrlForDedup(row.url)) : undefined;
     for (const k of hit) {
       const s = stats.get(k);
       if (!s) continue;
@@ -102,6 +170,7 @@ export function audit(titleFilter, history, scoresByUrl) {
   return {
     offers: history.length,
     keywords: positives.length,
+    duplicates,
     unmatchedRows: unmatched,
     dead: rows.filter((r) => r.hits === 0).map((r) => r.keyword),
     // Carries its weight only through other keywords: deleting it loses nothing.
@@ -113,84 +182,16 @@ export function audit(titleFilter, history, scoresByUrl) {
   };
 }
 
-// ── self-test ────────────────────────────────────────────────────────────────
-function selfTest() {
-  let pass = 0, fail = 0;
-  const ok = (c, m) => (c ? (pass++, console.log(`  ✅ ${m}`)) : (fail++, console.log(`  ❌ ${m}`)));
-
-  const tf = { positive: ['Inference', 'Machine Learning', 'Performance', 'Quantization'] };
-  const history = [
-    { url: 'u1', title: 'Senior Inference Engineer', company: 'A' },
-    { url: 'u2', title: 'Machine Learning Engineer, Inference', company: 'B' },
-    { url: 'u3', title: 'High-Performance Databases Engineer', company: 'C' },
-    { url: 'u4', title: 'Performance Engineer, Storage', company: 'D' },
-    { url: 'u5', title: 'Staff Performance Engineer', company: 'E' },
-    { url: 'u6', title: 'Performance Analyst', company: 'F' },
-    { url: 'u7', title: 'Perf Engineer', company: 'G' }, // matches nothing
-    { url: 'u8', title: 'Performance Tuning Engineer', company: 'H' },
-  ];
-  // Five Performance hits, all evaluated, mean exactly 1.5 — deliberately on the
-  // >=5 hits / <2.5 average boundary the noisy rule uses.
-  const scores = new Map([['u3', 1.5], ['u4', 1.8], ['u5', 2.0], ['u6', 1.2], ['u8', 1.0]]);
-  const r = audit(tf, history, scores);
-
-  ok(r.dead.includes('Quantization'), 'a keyword that matched nothing is reported dead');
-  ok(!r.dead.includes('Inference'), 'a keyword with hits is not dead');
-  ok(r.unmatchedRows === 1, 'rows matching no keyword are counted, not silently dropped');
-
-  const inf = r.rows.find((x) => x.keyword === 'Inference');
-  const ml = r.rows.find((x) => x.keyword === 'Machine Learning');
-  ok(inf.hits === 2 && inf.unique === 1, 'unique counts only offers this keyword alone caught');
-  ok(ml.unique === 0 && ml.hits === 1, 'a keyword riding on another contributes hits but no unique');
-  ok(r.redundant.includes('Machine Learning'), 'zero-unique keyword flagged redundant');
-
-  const perf = r.rows.find((x) => x.keyword === 'Performance');
-  ok(perf.hits === 5 && perf.avgScore === 1.5, 'average score computed over evaluated offers only');
-  ok(r.noisy.some((x) => x.keyword === 'Performance'), 'high-volume low-scoring keyword flagged noisy');
-  ok(!r.noisy.some((x) => x.keyword === 'Inference'), 'unscored keyword is not called noisy');
-
-  ok(r.rows[0].unique >= r.rows[r.rows.length - 1].unique, 'sorted by recall value, not raw hits');
-
-  console.log(`\n${fail === 0 ? '🟢' : '🔴'} ${pass} passed, ${fail} failed`);
-  process.exit(fail === 0 ? 0 : 1);
-}
-
-// ── main ─────────────────────────────────────────────────────────────────────
-const argv = process.argv.slice(2);
-if (argv.includes('--self-test')) selfTest();
-if (argv.includes('--help')) {
-  console.log(`filter-audit.mjs — what your title_filter is actually doing
-
-  node filter-audit.mjs             JSON
-  node filter-audit.mjs --summary   human-readable
-
-Answers "which keywords earn their keep" and "which generate noise" by
-replaying the matcher over data/scan-history.tsv.
-
-It cannot yet answer "what am I missing": that needs the titles the filter
-REJECTED, and the scanner records only a count of them (scan-runs.tsv
-filtered_title), never the titles. Adding a bounded reject log to scan.mjs
-would close it — the near-miss set is then (rejected titles) ∩ (cv.md
-vocabulary) − (current positives), derived rather than guessed.`);
-  process.exit(0);
-}
-
-if (!existsSync(PORTALS)) { console.error('portals.yml not found.'); process.exit(1); }
-const cfg = yaml.load(readFileSync(PORTALS, 'utf8')) || {};
-const history = existsSync(HISTORY) ? readHistory(readFileSync(HISTORY, 'utf8')) : [];
-const reportTexts = existsSync(REPORTS)
-  ? readdirSync(REPORTS).filter((f) => f.endsWith('.md') && !f.includes('RESERVED')).map((f) => readFileSync(join(REPORTS, f), 'utf8'))
-  : [];
-const result = audit(cfg.title_filter, history, readScoresByUrl(reportTexts));
-
-if (!argv.includes('--summary')) {
-  console.log(JSON.stringify(result, null, 2));
-} else {
+function printSummary(result) {
   console.log('TITLE FILTER AUDIT');
-  console.log(`${result.keywords} keywords replayed over ${result.offers} admitted offers`);
+  console.log(`${result.keywords} keywords replayed over ${result.offers} offers that passed the title filter`);
   if (result.unmatchedRows) console.log(`${result.unmatchedRows} historical rows match no current keyword (filter changed since)`);
   console.log('');
 
+  if (result.duplicates.length) {
+    console.log(`  DUPLICATE (${result.duplicates.length}) — the same keyword listed again; audited once:`);
+    console.log(`    ${result.duplicates.join(', ')}\n`);
+  }
   if (result.dead.length) {
     console.log(`  NEVER MATCHED (${result.dead.length}) — too narrow, misspelled, or the market does not use the word:`);
     console.log(`    ${result.dead.join(', ')}\n`);
@@ -215,5 +216,27 @@ if (!argv.includes('--summary')) {
   }
   console.log('\n  `unique` is the number to tune on. A keyword with hits but no unique can go;');
   console.log('  one with few hits and all of them unique is the only reason those were seen.');
-  console.log('  Run --help for why "what am I missing" is not answered here yet.');
 }
+
+function main() {
+  const args = process.argv.slice(2);
+  validateFlags(args, KNOWN_FLAGS, USAGE);
+
+  if (!existsSync(PORTALS_PATH)) {
+    console.error(`Error: portals.yml not found at ${PORTALS_PATH}. Run onboarding first - the audit reads its title_filter.`);
+    process.exit(1);
+  }
+  const cfg = loadYaml(readFileSync(PORTALS_PATH, 'utf-8')) || {};
+  const history = existsSync(SCAN_HISTORY_PATH) ? readHistory(readFileSync(SCAN_HISTORY_PATH, 'utf-8')) : [];
+  const reports = existsSync(REPORTS_DIR)
+    ? readdirSync(REPORTS_DIR)
+      .filter((f) => f.endsWith('.md') && !f.includes('RESERVED'))
+      .map((name) => ({ name, text: readFileSync(join(REPORTS_DIR, name), 'utf-8') }))
+    : [];
+  const result = audit(cfg.title_filter, history, readScoresByUrl(reports));
+
+  if (args.includes('--summary')) printSummary(result);
+  else console.log(JSON.stringify(result, null, 2));
+}
+
+if (isMainModule(import.meta.url)) main();

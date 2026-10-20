@@ -45,12 +45,14 @@
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import * as yaml from 'js-yaml';
+import { loadYaml } from './lib/yaml-document.mjs';
 import { LIVENESS_CONTEXT_OPTIONS, rejectPrivateOrInvalid } from './liveness-browser.mjs';
-import { getCareerOpsRoot } from './path-resolver.mjs';
+import { getCareerOpsRoot, getProfilePath } from './path-resolver.mjs';
 import { resolveAtsApi, JD_TEXT_API_ATS } from './liveness-api.mjs';
+import { classifyLiveness } from './liveness-core.mjs';
 import { decodeEntities } from './providers/_html-entities.mjs';
 import { isWorkModelOnly } from './providers/greenhouse.mjs';
+import { isZohoRecordClosed, parseZohoDetailPage } from './providers/zoho-recruit.mjs';
 import { DEFAULT_USER_AGENT } from './user-agent.mjs';
 import { flagValue, hasFlag, validateFlags } from './lib/cli-flags.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
@@ -89,10 +91,10 @@ const NAV_LABEL_STOPWORDS = new Set([
  * @param {string} [profilePath]
  * @returns {'cli'|'mcp'}
  */
-export function resolveExtractorMode(profilePath = join(CAREER_OPS, 'config/profile.yml')) {
+export function resolveExtractorMode(profilePath = getProfilePath()) {
   try {
     if (!existsSync(profilePath)) return 'mcp';
-    const raw = yaml.load(readFileSync(profilePath, 'utf-8')) || {};
+    const raw = loadYaml(readFileSync(profilePath, 'utf-8')) || {};
     const v = raw?.scan?.extractor;
     return v === 'cli' ? 'cli' : 'mcp';
   } catch {
@@ -112,10 +114,37 @@ export function compactText(s, cap = JD_TEXT_CAP) {
  * @param {string} finalUrl
  */
 export function normalizeJd(raw, finalUrl, textCap = JD_TEXT_CAP) {
+  // A schema.org JobPosting, when the page ships one, beats the rendered DOM:
+  // it is the posting body as the employer published it, not as their template
+  // happened to lay it out. On Phenom boards (careers.roche.com) the rendered
+  // <main> holds title, location and Apply chrome only — ~300 characters — while
+  // the body never becomes visible text at all, so the DOM path emitted a JD
+  // with no requirements in it and reported success. Same shape on other
+  // template-driven corporate boards, which is why this keys off the standard
+  // rather than off a host.
+  //
+  // Longer wins rather than JSON-LD always winning: plenty of pages carry a
+  // stub JobPosting (a one-line summary, or just the title) alongside a fully
+  // rendered body, and preferring the stub there would break the common case to
+  // fix the rare one.
+  const ldText = jdHtmlToText(raw?.jsonLdDescription || '');
+  // Normalized length, not raw length: raw DOM text on a chrome-heavy page is
+  // mostly repeated newlines ("Apply now\n\n\n\n\n\nSave job\n\n\n\n\n\n..."), which
+  // can out-length a shorter-in-raw-HTML but substantive JSON-LD description
+  // before either side is compacted. Comparing pre-collapse defeats the whole
+  // point of "longer wins". No cap here (Infinity) — only the comparison needs
+  // normalizing; the real textCap is still applied below.
+  const domText = compactText(String(raw?.text || ''), Infinity);
+  const text = ldText.length > domText.length ? ldText : domText;
+
   return {
     url: finalUrl,
-    title: compactText(raw?.title || '', 300),
-    text: compactText(raw?.text || '', textCap),
+    title: compactText(raw?.title || raw?.jsonLdTitle || '', 300),
+    text: compactText(text, textCap),
+    // For the liveness check in jdFailure() only. `text` has had nav/header/footer
+    // stripped, and an expired-posting banner often sits in one of them. Never
+    // emitted on the success path.
+    bodyText: compactText(raw?.bodyText || '', 4100),
   };
 }
 
@@ -474,7 +503,9 @@ export function normalizeLeverJob(json, postingUrl, textCap = JD_TEXT_CAP) {
         .filter(Boolean)
         .join('\n\n')
     : '';
-  const body = [str(json.descriptionPlain), lists, str(json.additionalPlain)].filter(Boolean).join('\n\n');
+  // Lever can leave descriptionPlain empty while description holds the HTML.
+  const intro = str(json.descriptionPlain) || jdHtmlToText(json.description);
+  const body = [intro, lists, str(json.additionalPlain)].filter(Boolean).join('\n\n');
   if (!body) return null;
 
   const meta = [];
@@ -523,6 +554,192 @@ async function fetchLeverJd(apiUrl, postingUrl, textCap, timeoutMs) {
 }
 
 /**
+ * Greenhouse posting reached through a company careers page (`?gh_jid=` only,
+ * no board in the URL). The embed redirect names the board — the same
+ * `followEmbed` hop liveness uses, which also pins the redirect target to
+ * greenhouse.io — and the per-job boards-api endpoint then ships the JD.
+ */
+async function fetchGreenhouseEmbeddedJd(resolved, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(resolved.apiUrl)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let jobApiUrl;
+  try {
+    const res = await fetch(resolved.apiUrl, {
+      headers: { 'user-agent': DEFAULT_USER_AGENT },
+      redirect: 'manual',
+      signal: controller.signal,
+    });
+    jobApiUrl = await resolved.followEmbed(res, resolved.parts);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+  return jobApiUrl ? fetchGreenhouseJd(jobApiUrl, postingUrl, textCap, timeoutMs) : null;
+}
+
+/**
+ * Shape one SmartRecruiters posting into a jd-mode result. Pure, same contract
+ * as the other normalizers. The body is `jobAd.sections`, HTML blocks appended
+ * in the order the rendered page shows them; the location object also carries
+ * remote/hybrid flags, surfaced because they are often the only work-model
+ * signal the posting has.
+ *
+ * @param {any} json - parsed postings-API response body
+ * @param {string} postingUrl
+ * @param {number} [textCap]
+ */
+export function normalizeSmartRecruitersJob(json, postingUrl, textCap = JD_TEXT_CAP) {
+  const sections = json?.jobAd?.sections;
+  if (!sections || typeof sections !== 'object') return null;
+
+  const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '');
+  const blocks = ['companyDescription', 'jobDescription', 'qualifications', 'additionalInformation']
+    .map((key) => {
+      const body = jdHtmlToText(sections[key]?.text);
+      return body ? [str(sections[key]?.title), body].filter(Boolean).join('\n') : '';
+    })
+    .filter(Boolean);
+  if (!blocks.length) return null;
+
+  const loc = json?.location || {};
+  const meta = [];
+  const where = str(loc.fullLocation) || [str(loc.city), str(loc.country)].filter(Boolean).join(', ');
+  if (where) meta.push(`Location: ${where}`);
+  if (loc.remote === true) meta.push('Work model: Remote');
+  else if (loc.hybrid === true) meta.push('Work model: Hybrid');
+
+  return {
+    url: postingUrl,
+    title: compactText(str(json?.name), 300),
+    text: compactText([meta.join('\n'), ...blocks].filter(Boolean).join('\n\n'), textCap),
+  };
+}
+
+async function fetchSmartRecruitersJd(apiUrl, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(apiUrl)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(apiUrl, {
+      headers: { accept: 'application/json', 'user-agent': DEFAULT_USER_AGENT },
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return normalizeSmartRecruitersJob(json, postingUrl, textCap);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Shape one Zoho Recruit posting page into a jd-mode result. Pure, same
+ * contract as the other normalizers. The page embeds the posting record
+ * (providers/zoho-recruit.mjs parseZohoDetailPage); its `Job_Description` is
+ * HTML. The record must be THIS posting's: a page carrying another id, or no
+ * record (a removed posting), returns null so the caller falls through.
+ *
+ * @param {any} html - the posting page's body
+ * @param {string} id - the {id} path segment from the posting URL
+ * @param {string} postingUrl
+ * @param {number} [textCap]
+ */
+export function normalizeZohoJob(html, id, postingUrl, textCap = JD_TEXT_CAP) {
+  const record = parseZohoDetailPage(html);
+  if (!record || String(record.id) !== String(id)) return null;
+  const body = jdHtmlToText(record.Job_Description);
+  if (!body) return null;
+
+  const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '');
+  const meta = [];
+  const location = [str(record.City), str(record.State), str(record.Country)].filter(Boolean).join(', ');
+  if (location) meta.push(`Location: ${location}`);
+  if (record.Remote_Job === true) meta.push('Work model: Remote');
+  if (str(record.Job_Type)) meta.push(`Job type: ${str(record.Job_Type)}`);
+  if (str(record.Salary)) meta.push(`Salary: ${str(record.Salary)}`);
+  if (str(record.Date_Opened)) meta.push(`Posted: ${str(record.Date_Opened)}`);
+  if (isZohoRecordClosed(record)) meta.push('Applications closed (the career site shows the posting as filled)');
+
+  return {
+    url: postingUrl,
+    title: compactText(str(record.Posting_Title) || str(record.Job_Opening_Name), 300),
+    text: compactText([meta.join('\n'), body].filter(Boolean).join('\n\n'), textCap),
+  };
+}
+
+async function fetchZohoJd(apiUrl, id, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(apiUrl)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(apiUrl, {
+      headers: { accept: 'text/html', 'user-agent': DEFAULT_USER_AGENT },
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    return normalizeZohoJob(await res.text(), id, postingUrl, textCap);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Workable full-body JD, independent of liveness state and listing text caps. */
+export function normalizeWorkableJob(json, shortcode, postingUrl, textCap = JD_TEXT_CAP) {
+  if (!json || typeof json !== 'object' || json.shortcode !== shortcode ||
+      typeof json.title !== 'string' || !json.title.trim()) return null;
+  const title = compactText(jdHtmlToText(json.title), 300);
+  if (!title) return null;
+  const blocks = [];
+  for (const [key, label] of [['description', 'Description'], ['requirements', 'Requirements'], ['benefits', 'Benefits']]) {
+    const html = typeof json[key] === 'string' ? json[key] : '';
+    // Decode before removing chrome: the API can entity-escape its HTML tags.
+    const body = jdHtmlToText(decodeEntities(html).replace(/<(nav|header|footer)\b[^>]*>[\s\S]*?<\/\1>/gi, ' '));
+    if (/[\p{L}\p{N}]/u.test(body)) blocks.push(`${label}:\n${body}`);
+  }
+  if (!blocks.length) return null;
+  return {
+    url: postingUrl,
+    title,
+    text: compactText(blocks.join('\n\n'), textCap),
+  };
+}
+
+/** Reuse the resolver's guarded share-link hop; never follow API redirects. */
+async function fetchWorkableJd(resolved, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(resolved.apiUrl)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const options = {
+    headers: { accept: 'application/json', 'user-agent': DEFAULT_USER_AGENT },
+    redirect: 'error',
+    signal: controller.signal,
+  };
+  try {
+    let apiUrl = resolved.apiUrl;
+    if (resolved.followEmbed) {
+      const redirect = await fetch(apiUrl, { ...options, redirect: 'manual' });
+      apiUrl = await resolved.followEmbed(redirect, resolved.parts);
+      if (!apiUrl || rejectPrivateOrInvalid(apiUrl)) return null;
+    }
+    const res = await fetch(apiUrl, options);
+    if (!res.ok) return null;
+    return normalizeWorkableJob(await res.json(), resolved.parts.shortcode, postingUrl, textCap);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * ats id → fetcher. THE routing table `fetchJdViaKnownApi` dispatches through,
  * exported so the owned test can assert its key set IS `JD_TEXT_API_ATS`.
  *
@@ -532,10 +749,13 @@ async function fetchLeverJd(apiUrl, postingUrl, textCap, timeoutMs) {
  * same deletion reddens it.
  *
  * Every entry takes the same `(resolved, url, textCap, timeoutMs)` shape so
- * dispatch stays a lookup; Ashby's extra `parts.jobId` argument is unpacked
- * inside its own entry rather than widening the shared signature.
+ * dispatch stays a lookup; the extra `parts` arguments (Ashby's `jobId`, Zoho
+ * Recruit's `id`) are unpacked inside their own entries rather than widening
+ * the shared signature.
  */
 export const JD_FETCHERS = {
+  workable: fetchWorkableJd,
+  'workable-short': fetchWorkableJd,
   workday: (resolved, url, textCap, timeoutMs) =>
     fetchWorkdayJd(resolved.apiUrl, url, textCap, timeoutMs),
   ashby: (resolved, url, textCap, timeoutMs) =>
@@ -544,6 +764,12 @@ export const JD_FETCHERS = {
     fetchGreenhouseJd(resolved.apiUrl, url, textCap, timeoutMs),
   lever: (resolved, url, textCap, timeoutMs) =>
     fetchLeverJd(resolved.apiUrl, url, textCap, timeoutMs),
+  'greenhouse-embedded': (resolved, url, textCap, timeoutMs) =>
+    fetchGreenhouseEmbeddedJd(resolved, url, textCap, timeoutMs),
+  smartrecruiters: (resolved, url, textCap, timeoutMs) =>
+    fetchSmartRecruitersJd(resolved.apiUrl, url, textCap, timeoutMs),
+  'zoho-recruit': (resolved, url, textCap, timeoutMs) =>
+    fetchZohoJd(resolved.apiUrl, resolved.parts.id, url, textCap, timeoutMs),
 };
 
 /**
@@ -584,18 +810,51 @@ export async function fetchJdViaKnownApi(url, textCap = JD_TEXT_CAP, timeoutMs =
  * A `--max-chars` below the floor is honored rather than made unsatisfiable: a
  * caller who asks for 50 chars gets 50, not a guaranteed failure.
  */
-function emitJd(result, maxChars) {
+/**
+ * Why a jd-mode result cannot be emitted, or null when it can. Pure — exported
+ * for tests.
+ *
+ * A page whose cleaned text is below the floor is either unreadable (a client-
+ * rendered shell: `empty_text`, worth another attempt) or gone (the posting
+ * was taken down: `unavailable`, terminal). Both produce the same empty text,
+ * because the "no longer available" banner usually sits in a header or footer
+ * that readDom() strips — so the unstripped body is checked too. A result at or
+ * above the floor is never reclassified: a full JD may quote such a phrase.
+ */
+export function jdFailure(result, maxChars) {
   const floor = Math.min(MIN_JD_TEXT_CHARS, maxChars);
-  if (result.text.length < floor) {
-    console.error(JSON.stringify({
-      error: `extracted ${result.text.length} chars of JD text (minimum ${floor}) — the page most likely renders its content client-side`,
-      code: 'empty_text',
-      url: result.url,
-    }));
+  if (result.text.length >= floor) return null;
+  // The shared liveness classifier, not a second phrase list. Only its
+  // posting-specific expiry verdicts count: `insufficient_content` is what a
+  // page that has not rendered yet looks like (liveness-browser treats it the
+  // same way), so it stays empty_text and remains worth retrying.
+  const verdict = classifyLiveness({
+    requestedUrl: result.url,
+    finalUrl: result.url,
+    bodyText: `${result.text}\n${result.bodyText || ''}`,
+  });
+  if (verdict.result === 'expired' && (verdict.code === 'expired_body' || verdict.code === 'expired_body_soft')) {
+    return { error: `posting is no longer available (${verdict.reason})`, code: 'unavailable', url: result.url };
+  }
+  return {
+    error: `extracted ${result.text.length} chars of JD text (minimum ${floor}) — the page most likely renders its content client-side`,
+    code: 'empty_text',
+    url: result.url,
+    body_text: String(result.bodyText || '').slice(0, 4000),
+  };
+}
+
+function emitJd(result, maxChars) {
+  const failure = jdFailure(result, maxChars);
+  if (failure) {
+    console.error(JSON.stringify(failure));
     process.exitCode = 1;
     return;
   }
-  process.stdout.write(JSON.stringify(result));
+  // bodyText exists only for jdFailure(); drop it so the documented success
+  // shape `{ url, title, text }` is unchanged.
+  const { bodyText: _bodyText, ...emitted } = result;
+  process.stdout.write(JSON.stringify(emitted));
 }
 
 /**
@@ -703,19 +962,41 @@ export function parseArgs(argv) {
 
 // Read the raw DOM inside the page: title, main visible text, and visible
 // anchors. Runs in the browser context; returns plain data only.
-async function readDom(page) {
+export async function readDom(page) {
   return page.evaluate(() => {
     const title = (document.querySelector('h1')?.innerText || document.title || '').trim();
 
     // Main text: prefer <main>/[role=main]/<article>, else body; strip nav chrome.
-    const root =
-      document.querySelector('main, [role="main"], article') || document.body;
+    // Keep the candidate with the most text left after stripping, not the first
+    // match: a board can lead with a short <article> (a share widget) ahead of
+    // the one holding the posting, and a <main> that is mostly menu would
+    // otherwise outrank it.
+    // Read innerText from the live element: on a detached clone it degrades to
+    // textContent, so CSS-hidden text would count and could outrank the posting.
+    // The chrome is hidden only for the read and its style attribute restored.
+    // script/style/noscript are never rendered, so innerText already skips them.
+    const strippedText = (el) => {
+      if (el.getClientRects().length === 0 && getComputedStyle(el).display !== 'contents') return '';
+      const chrome = Array.from(el.querySelectorAll('nav, header, footer'));
+      const saved = chrome.map((n) => n.getAttribute('style'));
+      // Attribute writes only: setting a property through n.style leaves style=""
+      // behind after removeAttribute. The prefix is the browser's serialized
+      // cssText, not the raw attribute, so an unterminated token in the original
+      // (an open /* comment) cannot swallow the appended display:none.
+      chrome.forEach((n) => n.setAttribute('style', `${n.style.cssText} display: none !important;`));
+      try {
+        return el.innerText || '';
+      } finally {
+        chrome.forEach((n, i) => (saved[i] == null ? n.removeAttribute('style') : n.setAttribute('style', saved[i])));
+      }
+    };
+    const candidates = Array.from(document.querySelectorAll('main, [role="main"], article'));
     let text = '';
-    if (root) {
-      const clone = root.cloneNode(true);
-      clone.querySelectorAll('script, style, nav, header, footer, noscript').forEach((el) => el.remove());
-      text = clone.innerText || '';
+    for (const el of candidates) {
+      const t = strippedText(el);
+      if (t.length > text.length) text = t;
     }
+    if (candidates.length === 0 && document.body) text = strippedText(document.body);
 
     const anchors = Array.from(document.querySelectorAll('a[href]'))
       .filter((el) => {
@@ -726,7 +1007,50 @@ async function readDom(page) {
       })
       .map((el) => ({ href: el.getAttribute('href') || '', label: (el.innerText || '').trim() }));
 
-    return { title, text, anchors };
+    // schema.org JobPosting, if present. Returned as the raw description markup
+    // so the shared jdHtmlToText() does the conversion, keeping one entity /
+    // block-break implementation rather than a second one inside the page.
+    let jsonLdDescription = '';
+    let jsonLdTitle = '';
+    for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
+      let parsed;
+      try {
+        parsed = JSON.parse(el.textContent || 'null');
+      } catch {
+        continue; // a malformed block must not cost us the well-formed one after it
+      }
+      // Publishers ship a bare object, an array, or an @graph wrapper.
+      const candidates = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed?.['@graph'])
+          ? parsed['@graph']
+          : [parsed];
+      // @type is the bare token in most feeds, but some publishers use the
+      // absolute schema.org IRI instead — both forms occur in the wild.
+      const isJobPostingType = (t) =>
+        t === 'JobPosting' || t === 'http://schema.org/JobPosting' || t === 'https://schema.org/JobPosting';
+      for (const node of candidates) {
+        const type = node?.['@type'];
+        const isJobPosting = Array.isArray(type) ? type.some(isJobPostingType) : isJobPostingType(type);
+        if (!isJobPosting) continue;
+        const desc = typeof node.description === 'string' ? node.description : '';
+        if (desc.length > jsonLdDescription.length) {
+          jsonLdDescription = desc;
+          // Always reset, never carry over: a stub JobPosting's title must not
+          // survive onto the description of a later, longer JobPosting node.
+          jsonLdTitle = typeof node.title === 'string' ? node.title : '';
+        }
+      }
+    }
+
+    // The unstripped body: `text` above removes nav/header/footer, where an
+    // expired-posting banner often lives.
+    // Head and tail, so a banner in the footer is still in the sample when the
+    // leading content fills the first 4000 characters.
+    const fullBody = document.body?.innerText || '';
+    const bodyText = fullBody.length > 4000 ? `${fullBody.slice(0, 2000)}\n…\n${fullBody.slice(-2000)}` : fullBody;
+
+    return { title, text, anchors, jsonLdDescription, jsonLdTitle, bodyText };
   });
 }
 

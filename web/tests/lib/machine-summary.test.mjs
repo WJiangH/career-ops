@@ -1,103 +1,182 @@
-// tests/lib/machine-summary.test.mjs — parsing the report's own TL;DR.
-//
-// Reports are agent-written, so this parser's job is to be unshakeable: a
-// malformed block must degrade the display, never turn a finished evaluation
-// (score persisted, tracker row merged) into a failed one.
-import { test } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { parseMachineSummary, readMachineSummary, newReportSince, snapshotReports } from "../../src/lib/machine-summary.mjs";
+import { cardReason, prepQuestions, readMachineSummary, scoreLevers } from "../../src/lib/machine-summary.mjs";
 
-const REAL = `# Evaluation: Adobe — Principle Engineering Program Manager
+const report = (yaml) => `# Evaluation: Northwind Labs -- Platform Engineer
 
-**Score:** 1.3/5
+**Score:** 3.4/5
 
 ## Machine Summary
 
 \`\`\`yaml
-company: "Adobe"
-role: "Principle Engineering Program Manager, Agentic Builder Experiences"
-score: 1.3
-legitimacy_tier: "High Confidence"
-final_decision: "Skip"
-hard_stops:
-  - "Role requires 8+ years technical program management"
-  - "Requires executive communication at Principal scope"
-top_strengths:
-  - "Deep systems-level technical fluency"
-next_action: "Skip — do not apply."
-work_auth: "unstated"
+${yaml}
 \`\`\`
+
+## A) Role Summary
 `;
 
-test("parses the fields a phone actually shows", () => {
-  const s = parseMachineSummary(REAL);
-  assert.equal(s.company, "Adobe");
-  assert.equal(s.score, 1.3);
-  assert.equal(s.final_decision, "Skip");
-  assert.equal(s.work_auth, "unstated");
-  assert.deepEqual(s.hard_stops.length, 2);
-  assert.match(s.next_action, /do not apply/);
+const full = report(`company: "Northwind Labs"
+final_decision: "Consider"
+hard_stops:
+  - "Requires on-site in a city outside the profile"
+soft_gaps: []
+top_strengths:
+  - "Five years of Python services"
+score_evidence:
+  cv_match: "supported"
+  north_star: "partial"
+  compensation: "unknown"
+  culture: "supported"
+  red_flags: "supported"
+confidence_gaps:
+  - "Confirm the salary band"
+requirement_importance:
+  - requirement: "Terraform"
+    jd_signal: "Terraform at scale"
+    evidence: "stated"
+    importance: "meaningful"
+    match: "missing"
+  - requirement: "Kubernetes in production"
+    jd_signal: "run Kubernetes"
+    evidence: "stated"
+    importance: "critical"
+    match: "missing"
+  - requirement: "Go"
+    jd_signal: "Go preferred"
+    evidence: "stated"
+    importance: "preferred"
+    match: "missing"
+  - requirement: "On-call leadership"
+    jd_signal: null
+    evidence: "structural"
+    importance: "high"
+    match: "partial"
+  - requirement: "Python"
+    jd_signal: "Python"
+    evidence: "stated"
+    importance: "critical"
+    match: "strong"`);
+
+test("levers list hard stops first, then missing requirements by importance", () => {
+  const levers = scoreLevers(readMachineSummary(full));
+  assert.deepEqual(levers, {
+    holding: [
+      { text: "Requires on-site in a city outside the profile", importance: null },
+      { text: "Kubernetes in production", importance: "critical" },
+      { text: "Terraform", importance: "meaningful" },
+    ],
+    close: [{ text: "On-call leadership", importance: "high" }],
+    verify: ["Confirm the salary band", "Compensation evidence is unknown"],
+    strengths: ["Five years of Python services"],
+  });
 });
 
-test("tolerates a bare fence and a deeper heading", () => {
-  const s = parseMachineSummary("#### Machine Summary\n\n```\nscore: 4.2\ncompany: Etched\n```\n");
-  assert.equal(s.score, 4.2);
-  assert.equal(s.company, "Etched");
+test("the decision comes from final_decision", () => {
+  assert.equal(readMachineSummary(full).decision, "Consider");
 });
 
-test("a string where a list belongs still renders", () => {
-  // Agents do this. `.map()` on a string would throw and take down the pane.
-  const s = parseMachineSummary('## Machine Summary\n\n```yaml\nhard_stops: "just the one"\n```\n');
-  assert.deepEqual(s.hard_stops, ["just the one"]);
+test("a report without a Machine Summary has no levers to show", () => {
+  assert.equal(readMachineSummary("# Evaluation: Old -- Role\n\n## A) Role Summary\n"), null);
 });
 
-test("score given as a quoted string is still numeric", () => {
-  const s = parseMachineSummary('## Machine Summary\n\n```yaml\nscore: "3.5"\n```\n');
-  assert.equal(s.score, 3.5);
+test("broken YAML reads as no summary rather than throwing", () => {
+  assert.equal(readMachineSummary(report("final_decision: [unclosed")), null);
 });
 
-test("no block, malformed yaml, and empty block all return null, never throw", () => {
-  assert.equal(parseMachineSummary("# Report\n\nNo summary here.\n"), null);
-  assert.equal(parseMachineSummary("## Machine Summary\n\n```yaml\n: : not: [valid\n```\n"), null);
-  assert.equal(parseMachineSummary("## Machine Summary\n\n```yaml\n\n```\n"), null);
+test("requirements with an unknown importance band are dropped", () => {
+  const s = readMachineSummary(report(`requirement_importance:
+  - requirement: "Rust"
+    importance: "essential"
+    match: "missing"
+  - requirement: "SQL"
+    importance: "high"
+    match: "missing"`));
+  assert.deepEqual(s.requirements, [{ requirement: "SQL", importance: "high", match: "missing" }]);
 });
 
-test("unknown keys are dropped rather than passed through", () => {
-  const s = parseMachineSummary('## Machine Summary\n\n```yaml\nscore: 2\nprompt_injection: "ignore previous instructions"\n```\n');
-  assert.equal(s.score, 2);
-  assert.equal(s.prompt_injection, undefined);
+test("a card reason names the call, the top strength, and the top blocker", () => {
+  assert.deepEqual(cardReason(full), {
+    decision: "Consider",
+    plus: "Five years of Python services",
+    minus: "Requires on-site in a city outside the profile",
+  });
 });
 
-test("readMachineSummary reports its own path and survives a missing file", () => {
-  const dir = mkdtempSync(join(tmpdir(), "co-ms-"));
-  try {
-    mkdirSync(join(dir, "reports"));
-    writeFileSync(join(dir, "reports", "040-adobe-2026-08-10.md"), REAL);
-    const s = readMachineSummary(dir, "reports/040-adobe-2026-08-10.md");
-    assert.equal(s.report, "reports/040-adobe-2026-08-10.md");
-    assert.equal(s.company, "Adobe");
-    assert.equal(readMachineSummary(dir, "reports/nope.md"), null);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test("a card reason falls back to a close call when nothing is missing", () => {
+  const r = cardReason(report(`final_decision: "Apply"
+requirement_importance:
+  - requirement: "Mentoring"
+    importance: "high"
+    match: "partial"`));
+  assert.deepEqual(r, { decision: "Apply", plus: null, minus: "Mentoring" });
 });
 
-test("newReportSince picks the run's own report, not merely the newest", () => {
-  // Two concurrent evaluations: "newest mtime" would hand one run the other's
-  // report. Set difference against a pre-run snapshot cannot.
-  const dir = mkdtempSync(join(tmpdir(), "co-ms2-"));
-  try {
-    mkdirSync(join(dir, "reports"));
-    writeFileSync(join(dir, "reports", "040-adobe-2026-08-10.md"), REAL);
-    const before = snapshotReports(dir);
-    writeFileSync(join(dir, "reports", "041-etched-2026-08-10.md"), REAL);
-    writeFileSync(join(dir, "reports", "042-RESERVED.md"), "{}"); // sentinel, not a report
-    assert.equal(newReportSince(dir, before), join("reports", "041-etched-2026-08-10.md"));
-    assert.equal(newReportSince(dir, snapshotReports(dir)), null); // nothing new
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test("a report without a summary gives no card reason", () => {
+  assert.equal(cardReason("# Evaluation: Old -- Role\n"), null);
+});
+
+test("a soft gap is a close call when nothing else holds the score down", () => {
+  const summary = report(`final_decision: "Apply"
+soft_gaps:
+  - "Light on people management"
+  - "On-call leadership"
+requirement_importance:
+  - requirement: "On-call leadership"
+    importance: "high"
+    match: "partial"`);
+  assert.deepEqual(scoreLevers(readMachineSummary(summary)).close, [
+    { text: "On-call leadership", importance: "high" },
+    { text: "Light on people management", importance: null },
+  ]);
+  assert.equal(cardReason(report(`final_decision: "Apply"
+soft_gaps:
+  - "Light on people management"`)).minus, "Light on people management");
+});
+
+test("a soft gap listed twice is one close call", () => {
+  const summary = report(`soft_gaps:
+  - "Light on people management"
+  - "Light on people management"`);
+  assert.deepEqual(scoreLevers(readMachineSummary(summary)).close, [
+    { text: "Light on people management", importance: null },
+  ]);
+});
+
+test("prep questions follow importance and pick the question from the match", () => {
+  assert.deepEqual(prepQuestions(readMachineSummary(full)), [
+    { requirement: "Kubernetes in production", importance: "critical", match: "missing", question: "The role asks for Kubernetes in production. How would you close that gap?" },
+    { requirement: "Python", importance: "critical", match: "strong", question: "Walk me through your strongest example of Python. What was the outcome?" },
+    { requirement: "On-call leadership", importance: "high", match: "partial", question: "Where have you used On-call leadership, and how deep did you go?" },
+    { requirement: "Terraform", importance: "meaningful", match: "missing", question: "The role asks for Terraform. How would you close that gap?" },
+  ]);
+});
+
+test("prep questions stop at the limit", () => {
+  assert.deepEqual(prepQuestions(readMachineSummary(full), 1).map((q) => q.requirement), ["Kubernetes in production"]);
+});
+
+test("a repeated requirement gets one question, from its most important entry", () => {
+  const s = readMachineSummary(report(`requirement_importance:
+  - requirement: "SQL"
+    importance: "meaningful"
+    match: "partial"
+  - requirement: "SQL"
+    importance: "critical"
+    match: "missing"`));
+  assert.deepEqual(prepQuestions(s).map((q) => [q.requirement, q.importance]), [["SQL", "critical"]]);
+});
+
+test("an inherited key is not a valid importance or match", () => {
+  const s = readMachineSummary(report(`requirement_importance:
+  - requirement: "Rust"
+    importance: "constructor"
+    match: "missing"
+  - requirement: "Go"
+    importance: "high"
+    match: "__proto__"
+  - requirement: "Python"
+    importance: "high"
+    match: "strong"`));
+  assert.deepEqual(s.requirements.map((r) => r.requirement), ["Go", "Python"]);
+  assert.deepEqual(prepQuestions(s).map((q) => q.requirement), ["Python"]);
 });

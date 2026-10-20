@@ -8,12 +8,18 @@
 // exercised without touching the rate-limited ATS directories.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   buildHintStopwords,
   companyFromHost,
   companyHintsFromQuery,
   unminedHints,
   findUnmined,
+  runUnmined,
 } from '../verify-portals.mjs';
 
 const CFG = {
@@ -194,4 +200,109 @@ test('probing stops at the first hit for a company', async () => {
   };
   await findUnmined(cfg, { fetchJson });
   assert.ok(calls <= 3, `stopped early, took ${calls} probes for a first-candidate hit`);
+});
+
+test('a tracked name spelled without the space still counts as tracked', () => {
+  // CodeRabbit on #2730: the raw hint "scale nova" matched neither the tracked
+  // name "scalenova" nor its slug shapes, so a tracked company was reported as
+  // unmined and `--strict --unmined` failed for nothing.
+  const query = '"Scale Nova" OR Cerebras';
+  for (const name of ['ScaleNova', 'Scale-Nova', 'Scale Nova']) {
+    const cfg = { ...CFG, tracked_companies: [{ name }], search_queries: [{ name: 'q', query }] };
+    assert.ok(!unminedHints(cfg).some((h) => h.hint === 'scale nova'), `tracked as "${name}"`);
+  }
+});
+
+test('a tracked first word does not hide a different company', () => {
+  // Matching on every slug candidate would include the first word, so a
+  // tracked "Scale" would swallow an untracked "Scale Nova".
+  const cfg = { ...CFG, tracked_companies: [{ name: 'Scale' }], search_queries: [{ name: 'q', query: '"Scale Nova"' }] };
+  assert.deepEqual(unminedHints(cfg).map((h) => h.hint), ['scale nova']);
+});
+
+test('the CLI accepts --unmined and no-ops without a portals file', () => {
+  // main() validates flags before any network work; --unmined has to be a
+  // known flag or the command exits 1 before it starts.
+  const dir = mkdtempSync(join(tmpdir(), 'unmined-cli-'));
+  try {
+    const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'verify-portals.mjs');
+    const out = execFileSync(process.execPath, [script, '--unmined', '--file', join(dir, 'absent.yml')], {
+      encoding: 'utf-8', timeout: 20000,
+    });
+    assert.match(out, /no portals file at .*nothing to check/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an EU-only Lever board is found', async () => {
+  // Lever is one ATS key with an eu flag; probing only api.lever.co reported an
+  // EU-only tenant as having no Lever board (CodeRabbit, #2730).
+  const cfg = { ...CFG, search_queries: [{ name: 'x', query: 'site:cerebras.ai "RTL"' }] };
+  const fetchJson = async (url) => {
+    if (url.startsWith('https://api.eu.lever.co/v0/postings/cerebras')) return [{ text: 'x' }];
+    const e = new Error('404'); e.status = 404; throw e;
+  };
+  const [r] = await findUnmined(cfg, { fetchJson });
+  assert.equal(r.hit?.ats, 'lever');
+  assert.equal(r.hit?.eu, true);
+  assert.equal(r.probeError, null);
+});
+
+test('a probe that failed for another reason than 404 is unverified, not "no board"', async () => {
+  const cfg = { ...CFG, search_queries: [{ name: 'x', query: 'site:cerebras.ai "RTL"' }] };
+  const fetchJson = async (url) => {
+    const e = new Error(url.includes('ashbyhq') ? 'HTTP 429' : '404');
+    e.status = url.includes('ashbyhq') ? 429 : 404;
+    throw e;
+  };
+  const [r] = await findUnmined(cfg, { fetchJson });
+  assert.equal(r.hit, null);
+  assert.equal(r.probeError?.ats, 'ashby');
+  assert.equal(r.probeError?.httpStatus, 429);
+});
+
+test('every candidate 404ing is still a plain "no board"', async () => {
+  const cfg = { ...CFG, search_queries: [{ name: 'x', query: 'site:cerebras.ai "RTL"' }] };
+  const [r] = await findUnmined(cfg, { fetchJson: fakeFetch([]) });
+  assert.equal(r.hit, null);
+  assert.equal(r.probeError, null);
+});
+
+test('runUnmined counts unverified names for --strict and says so', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'unmined-run-'));
+  const logged = [];
+  const log = console.log;
+  try {
+    const file = join(dir, 'portals.yml');
+    writeFileSync(file, 'search_queries:\n  - name: x\n    query: \'site:cerebras.ai OR site:baseten.co\'\n');
+    const fetchJson = async (url) => {
+      const e = new Error('x');
+      e.status = url.includes('/cerebras') ? 503 : 404;
+      throw e;
+    };
+    console.log = (...a) => logged.push(a.join(' '));
+    const n = await runUnmined(file, { fetchJson });
+    console.log = log;
+    const out = logged.join('\n');
+    assert.equal(n, 1, 'one unverified name fails --strict');
+    assert.match(out, /cerebras — could not verify \(.*HTTP 503\)/);
+    assert.match(out, /baseten — no greenhouse\/ashby\/lever board/);
+    assert.doesNotMatch(out, /earning their keep/);
+  } finally {
+    console.log = log;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('runUnmined can be called without options', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'unmined-noopts-'));
+  const log = console.log;
+  try {
+    console.log = () => {};
+    assert.equal(await runUnmined(join(dir, 'absent.yml')), 0);
+  } finally {
+    console.log = log;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
