@@ -199,12 +199,15 @@ function runScanner(
   return new Promise((resolve) => {
     const args = [
       rootScript("scan-ats-full"),
-      ...scannerArgs({ ats, json: useJson, sinceDays: filters.sinceDays, limitPerAts: filters.limitPerAts }),
+      ...scannerArgs({ ats, json: useJson, sinceDays: filters.sinceDays, limitPerAts: filters.limitPerAts, preferKnown: true }),
     ];
 
     const child = spawn(process.execPath, args, {
       cwd: careerOpsRoot(),
-      env: { ...process.env, CAREER_OPS_PORTALS: tempPortals },
+      // The killer below fires at 230s and a killed sweep returns nothing, so no
+      // single oversized tenant may hold the run that long: 60s each, and the
+      // scanner reports the ones it gave up on.
+      env: { ...process.env, CAREER_OPS_PORTALS: tempPortals, CAREER_OPS_COMPANY_TIMEOUT_S: "60" },
     });
 
     const { offers, seen } = sink;

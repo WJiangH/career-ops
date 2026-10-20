@@ -12,6 +12,7 @@
 // and omitted for the unbounded "30+ Days Ago" form.
 
 import { BROWSER_LIKE_USER_AGENT, fetchJsonWithRetry, sleep } from './_http.mjs';
+import { AND_SEPARATOR } from '../title-keywords.mjs';
 
 // Why one paginated pass (the unfaceted root crawl, or one facet-split slice)
 // stopped. COMPLETE covers both "ran out of pages" and "hit the offset
@@ -100,6 +101,47 @@ const SPLIT_PAGE_BUDGET_FACTOR = 5;
 // margin only needs to clear that; 2 is double it as a plain safety factor,
 // not a second measurement.
 const EARLY_STOP_MARGIN_MS = 2 * 86_400_000;
+
+/**
+ * Turn title_filter keywords into a CXS `searchText` query.
+ *
+ * Without one the provider crawls an entire board and filters locally, which on
+ * a large retail/health tenant means thousands of postings (and facet slicing
+ * past the 2000-offset clamp) to find a handful of matches. The CXS search is a
+ * fuzzy full-text match over title AND description — it is a recall pre-filter,
+ * never a substitute for the local title filter, which still runs afterwards.
+ *
+ * Syntax measured against live tenants: space is AND, `OR` is OR, and a quoted
+ * phrase binds its words into one operand (an unquoted `a b OR c` is a flat
+ * `a OR b OR c`). Quotes do not enforce word order or adjacency. No length cap
+ * was hit at 5,000+ characters.
+ *
+ * `word:` / `stem:` prefixes only tune the local matcher and are dropped; an
+ * `a + b` AND-group becomes the space-joined (AND) terms. Returns '' when there
+ * is nothing usable, which means "no search" — never an empty-query error.
+ *
+ * @param {Iterable<unknown>} keywords
+ * @returns {string}
+ */
+export function buildSearchText(keywords) {
+  const seen = new Set();
+  const phrases = [];
+  for (const raw of keywords || []) {
+    if (typeof raw !== 'string') continue;
+    const phrase = raw
+      .replace(/^\s*(?:word|stem):/i, '')
+      .split(AND_SEPARATOR)
+      .map((t) => t.replace(/^\s*(?:word|stem):/i, '').replace(/["\\]/g, ' ').trim())
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .toLowerCase();
+    if (!phrase || seen.has(phrase)) continue;
+    seen.add(phrase);
+    phrases.push(`"${phrase}"`);
+  }
+  return phrases.join(' OR ');
+}
 
 /** Resolve the page cap: a positive integer `max_pages` on the entry, capped. */
 function resolveMaxPages(entry) {
@@ -820,8 +862,16 @@ export default {
         referer: `${ep.jobBase}/`,
       },
     };
-    const makeBody = (offset, appliedFacets) => JSON.stringify({ limit: PAGE_SIZE, offset, searchText: '', appliedFacets });
+    const searchText = typeof ctx?.searchText === 'string' ? ctx.searchText : '';
+    const makeBody = (offset, appliedFacets) => JSON.stringify({ limit: PAGE_SIZE, offset, searchText, appliedFacets });
     const sinceMs = typeof ctx?.sinceMs === 'number' ? ctx.sinceMs : null;
+    // A search reorders results by relevance, not newest-first: measured on a
+    // live tenant, page 0 of a query held "30+ Days Ago" postings ahead of
+    // "2 Days Ago" ones. Early-stop reads "this page is stale" as "every later
+    // page is stale", which is only true of the newest-first default order, so
+    // with a query it would silently drop fresh matches. A search result set is
+    // small, so walking all of it is cheap; the local date filter still applies.
+    const earlyStopMs = searchText ? null : sinceMs;
     const maxPages = resolveMaxPages(entry);
 
     // Honor a context page cap — verify-portals' liveness probe sets
@@ -884,7 +934,7 @@ export default {
       // FETCH_ERROR must NOT produce the "raise max_pages" advice: that knob
       // does nothing for a tenant that died on a rate limit rather than hit the cap.
       let stopReason = STOP_REASON.COMPLETE;
-      if (pageIsPastWindow(jobs, sinceMs)) stopReason = STOP_REASON.EARLY_STOP;
+      if (pageIsPastWindow(jobs, earlyStopMs)) stopReason = STOP_REASON.EARLY_STOP;
       // Some tenants' CXS responses never include postedOn at all (e.g.
       // adventhealth, on every page). Early-stop can't apply then — there's
       // no dated posting to recognize as "past the window".
@@ -936,7 +986,7 @@ export default {
             const postings = Array.isArray(json?.jobPostings) ? json.jobPostings : [];
             if (postings.length < PAGE_SIZE) break; // short page → last page reached
           }
-          if (pageIsPastWindow(pageJobs, sinceMs)) { stopReason = STOP_REASON.EARLY_STOP; break; }
+          if (pageIsPastWindow(pageJobs, earlyStopMs)) { stopReason = STOP_REASON.EARLY_STOP; break; }
         }
         if (stopReason === STOP_REASON.COMPLETE && page === pagesToFetch && pagesToFetch === maxPages) {
           stopReason = STOP_REASON.CAP;

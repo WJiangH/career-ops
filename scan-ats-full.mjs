@@ -61,7 +61,7 @@ import { isResolverFailure, dnsPacingStats } from './providers/_dns-cache.mjs';
 import greenhouse from './providers/greenhouse.mjs';
 import lever from './providers/lever.mjs';
 import ashby from './providers/ashby.mjs';
-import workday, { WORKDAY_TRUNCATED_REASON } from './providers/workday.mjs';
+import workday, { WORKDAY_TRUNCATED_REASON, buildSearchText as buildWorkdaySearchText } from './providers/workday.mjs';
 import icims from './providers/icims.mjs';
 import bamboohr from './providers/bamboohr.mjs';
 import { buildTitleFilter, buildTitleFilterOverrides, buildTitleFilterWithOverrides, buildLocationFilter, buildContentFilter, matchedTitleKeywords, loadSeenUrls, normalizeUrlForDedup, appendToPipeline, appendToScanHistory, findBlacklistEntry, loadBlacklist, parseSinceDays, PORTALS_PATH, PIPELINE_PATH, SCAN_HISTORY_PATH } from './scan.mjs';
@@ -76,6 +76,7 @@ import { barePrefixDomainKeywords, buildDomainFilter } from './title-keywords.mj
 import { KNOWN_ATS_VENDORS } from './ats-vendor.mjs';
 import { loadHistoryAtsSeeds } from './history-ats-seeds.mjs';
 import { loadProviders } from './providers/_registry.mjs';
+import { loadKnownCompanies, sampleWithPriority, datasetKey } from './lib/company-priority.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -159,6 +160,7 @@ function validCheckpointCurrent(cur) {
 export function checkpointCompatible(cp, opts) {
   return Boolean(cp)
     && !opts.shuffle
+    && !opts.preferKnown
     && JSON.stringify(cp.ats) === JSON.stringify(opts.ats)
     && (cp.limit ?? null) === (opts.limit === Infinity ? null : opts.limit)
     && cp.includeUndated === opts.includeUndated;
@@ -365,7 +367,7 @@ export const SOURCES = {
 const KNOWN_FLAGS = [
   '--since', '--limit', '--ats', '--seeds', '--history-seeds', '--dry-run', '--liveness',
   '--verbose', '--md-out', '--json', '--include-undated', '--include-blacklisted',
-  '--shuffle', '--resume', '--help', '-h',
+  '--shuffle', '--prefer-known', '--resume', '--help', '-h',
 ];
 
 // Flags that consume the next argv token as a value (space-separated form —
@@ -384,6 +386,7 @@ const USAGE = `Usage:
   node scan-ats-full.mjs --include-blacklisted # audit: let data/blacklist.md matches through, annotated
   node scan-ats-full.mjs --verbose            # log per-board fetch failures
   node scan-ats-full.mjs --md-out <dir>       # also write a dated markdown digest to <dir>
+  node scan-ats-full.mjs --prefer-known       # with --limit: tracked/past-match companies first, then a random fill
   node scan-ats-full.mjs --resume             # continue an interrupted sweep from its checkpoint
   node scan-ats-full.mjs --help               # print this usage block and exit`;
 
@@ -466,6 +469,7 @@ export function parseArgs(argv) {
     includeUndated: args.includes('--include-undated'),
     includeBlacklisted: args.includes('--include-blacklisted'),
     shuffle: args.includes('--shuffle'),
+    preferKnown: args.includes('--prefer-known'),
     resume: args.includes('--resume'),
   };
 }
@@ -977,7 +981,12 @@ export async function runHistorySeedScan(seeds, providers, opts, ctx, processJob
 // One company's whole fetch may not exceed this — even with per-request
 // timeouts in _http.mjs, an unforeseen hang (DNS, a provider bug) must cost
 // one company, not freeze a worker slot for the rest of a 12k-company sweep.
-const COMPANY_TIMEOUT_MS = 5 * 60_000;
+// CAREER_OPS_COMPANY_TIMEOUT_S lowers it for callers with their own deadline
+// (the web Explorer kills the sweep at 230s and gets nothing back if one
+// oversized tenant holds the run past that).
+const COMPANY_TIMEOUT_MS = (Number(process.env.CAREER_OPS_COMPANY_TIMEOUT_S) > 0
+  ? Number(process.env.CAREER_OPS_COMPANY_TIMEOUT_S)
+  : 5 * 60) * 1000;
 
 // Run one board's unit of work. For a source that gives every tenant its own
 // hostname (workday, icims, bamboohr), the board gets a private connection
@@ -1189,7 +1198,7 @@ async function main() {
   const seedsSummary = opts.seeds.length ? `seeds: ${opts.seeds.join(', ')}` : '';
   const historySummary = opts.historySeeds ? 'history seeds' : '';
   const sourcesSummary = [atsSummary, seedsSummary, historySummary].filter(Boolean).join(' | ');
-  log(`Reverse ATS scan — ${sourcesSummary} | since ${opts.sinceDays}d${opts.limit < Infinity ? ` | limit ${opts.limit}/ats` : ''}${opts.shuffle ? ' | shuffled' : ''}${opts.includeUndated ? ' | +undated' : ''}${opts.liveness ? ' | liveness' : ''}${domainFilter ? ' | domain gate' : ''}${opts.dryRun ? ' | DRY RUN' : ''}`);
+  log(`Reverse ATS scan — ${sourcesSummary} | since ${opts.sinceDays}d${opts.limit < Infinity ? ` | limit ${opts.limit}/ats` : ''}${opts.shuffle ? ' | shuffled' : ''}${opts.preferKnown ? ' | prefer-known' : ''}${opts.includeUndated ? ' | +undated' : ''}${opts.liveness ? ' | liveness' : ''}${domainFilter ? ' | domain gate' : ''}${opts.dryRun ? ' | DRY RUN' : ''}`);
 
   // extraTokensFor: a historical scan-history.tsv row records the URL it was
   // FIRST seen on, so without this a Workday requisition seen last run under
@@ -1204,6 +1213,7 @@ async function main() {
   });
   const blacklist = loadBlacklist();
   opts.blacklist = blacklist;
+  const knownCompanies = opts.preferKnown ? loadKnownCompanies() : new Set();
   // sinceMs and includeUndated let providers (currently only workday.mjs)
   // stop paginating a tenant early instead of always walking to max_pages:
   // sinceMs once postings are confidently past the --since window, and
@@ -1222,6 +1232,17 @@ async function main() {
     includeUndated: opts.includeUndated,
     syntheticEntries: true,
     locationHints: config?.location_filter,
+    // Workday only (other providers ignore it): push the title keywords into the
+    // server-side search so a large tenant returns its few relevant postings
+    // instead of being crawled end to end. Per-company positive_extra is
+    // unioned in, since a search built from `positive` alone would hide those
+    // titles from the local filter before it ever saw them.
+    searchText: buildWorkdaySearchText([
+      ...(fullTitleFilterConfig?.positive ?? []),
+      ...(Array.isArray(config?.title_filter_overrides)
+        ? config.title_filter_overrides.flatMap(o => (Array.isArray(o?.positive_extra) ? o.positive_extra : []))
+        : []),
+    ]),
   };
   // The LOCAL calendar day, not the UTC one. This value lands in
   // scan-history.tsv's first_seen, which shouldDedupScanHistoryRow measures the
@@ -1252,6 +1273,11 @@ async function main() {
   let totalCompaniesScanned = cc.totalCompaniesScanned || 0;
   let totalCompaniesAvailable = 0;
   let totalErrors = cc.totalErrors || 0;
+  // Boards abandoned by the per-company watchdog. They are part of
+  // `unreachable`, but a timeout is not a dead board: it means a real tenant
+  // was too big to finish in time, which the user needs to be able to see.
+  const timedOutBoards = [];
+  let blacklistedBoardsSkipped = 0;
   let totalRetiredBoardsSkipped = cc.totalRetiredBoardsSkipped || 0;
   let droppedNoDate = cc.droppedNoDate || 0;
   let droppedContent = cc.droppedContent || 0;
@@ -1411,7 +1437,20 @@ async function main() {
       continue;
     }
     const datasetHash = datasetFingerprint(list);
-    const entriesAll = sampleCompanies(list, opts.limit, opts.shuffle).map(source.toEntry).filter(Boolean);
+    // Blacklisted companies are dropped BEFORE sampling, not just from the
+    // results afterwards (filterBlacklistedOffers below stays as the backstop):
+    // fetching a board only to discard every posting wastes a slot in the cap
+    // and its share of the sweep. --include-blacklisted is the audit switch, so
+    // it keeps them in. `list` itself stays whole — the checkpoint hash and
+    // length describe the dataset, not this user's preferences.
+    const candidates = blacklist.size > 0 && !opts.includeBlacklisted
+      ? list.filter(e => !blacklist.has(normalizeCompany(datasetKey(e))))
+      : list;
+    blacklistedBoardsSkipped += list.length - candidates.length;
+    const sampled = opts.preferKnown
+      ? sampleWithPriority(candidates, opts.limit, knownCompanies)
+      : sampleCompanies(candidates, opts.limit, opts.shuffle);
+    const entriesAll = sampled.map(source.toEntry).filter(Boolean);
 
     let startAt = 0;
     if (checkpoint && checkpoint.current?.name === name) {
@@ -1524,6 +1563,7 @@ async function main() {
         // Mostly defunct boards in the public dataset — expected noise, so the
         // default stays quiet; --verbose surfaces per-board failures.
         errors++;
+        if (/timed out after/.test(String(err?.message))) timedOutBoards.push(`${name}/${entry.name}`);
         recordBoardFailure(deadBoards, name, deadBoard, err);
         // A dead board and a dead resolver look identical one at a time; only
         // the *consecutive* run tells them apart, so any non-resolver outcome
@@ -1700,6 +1740,8 @@ async function main() {
   printScanSummaryHeader('Reverse ATS Scan', date, log);
   log(`Companies scanned:  ${totalCompaniesScanned}${capHit ? ` of ${totalCompaniesAvailable} (capped)` : ''}`);
   log(`Unreachable boards: ${totalErrors}`);
+  if (blacklistedBoardsSkipped) log(`Blacklisted:        ${blacklistedBoardsSkipped} boards skipped before fetching`);
+  if (timedOutBoards.length) log(`Timed out:         ${timedOutBoards.length} too large to finish (${timedOutBoards.slice(0, 8).join(', ')}${timedOutBoards.length > 8 ? ', …' : ''})`);
   if (cappedBoards) log(`Page-capped boards: ${cappedBoards} (partial coverage — later postings not scanned)`);
   // Reported whenever the gate RAN, including when it skipped nothing: a zero
   // there is the useful reading that the domain list admitted every board, and
@@ -1805,6 +1847,8 @@ async function main() {
       postingsAnnotatedBlacklisted: blacklistResult.annotatedBlacklisted,
       postingsDroppedContent: droppedContent,
       unreachableBoards: totalErrors,
+      timedOutBoards,
+      blacklistedBoardsSkipped,
       retiredBoardsSkipped: totalRetiredBoardsSkipped,
       cappedBoards,
       // `domainFilterActive` is not derivable from the two counts: zero skipped
@@ -1843,8 +1887,17 @@ async function main() {
 
 // Only run main() when invoked directly, not when imported by tests.
 if (isMainModule(import.meta.url)) {
-  main().catch(err => {
-    console.error('Fatal:', err.message);
-    process.exit(1);
-  });
+  main()
+    .catch(err => {
+      console.error('Fatal:', err.message);
+      process.exitCode = 1;
+    })
+    // A company that hit the watchdog is only abandoned, not cancelled: its
+    // provider.fetch() keeps paginating in the background and holds the event
+    // loop open, so a finished sweep would sit there for minutes (and the web
+    // Explorer, waiting on exit, would time out with the result already
+    // printed). Exit once both streams have drained so piped output is whole.
+    .then(() => {
+      process.stdout.write('', () => process.stderr.write('', () => process.exit(process.exitCode ?? 0)));
+    });
 }

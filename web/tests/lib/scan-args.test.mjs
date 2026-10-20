@@ -41,3 +41,11 @@ test("scannerArgs keeps the window, sources, cap and output mode Explore asked f
     ["--dry-run", "--since", "7", "--ats", "ashby", "--limit", "150", "--shuffle", "--json"],
   );
 });
+
+test("preferKnown asks the scanner to put known companies first, on top of the shuffle", { skip: !scanner }, () => {
+  const args = scannerArgs({ ats: ["greenhouse"], json: false, sinceDays: 7, limitPerAts: 150, preferKnown: true });
+  const opts = scanner.parseArgs(["node", "scan-ats-full.mjs", ...args]);
+  assert.equal(opts.preferKnown, true);
+  assert.equal(opts.shuffle, true);
+  assert.equal(scannerArgs({ ats: ["greenhouse"], json: false, sinceDays: 7, limitPerAts: 150 }).includes("--prefer-known"), false);
+});
